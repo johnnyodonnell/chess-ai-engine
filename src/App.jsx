@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Board from './components/Board.jsx'
 import Status from './components/Status.jsx'
-import { bestMove } from './engine/random.js'
+import { bestMove, preload } from './engine/alphazero/index.js'
 import {
   HUMAN,
   applyMove,
@@ -10,7 +10,8 @@ import {
   isGameOver,
 } from './engine/game.js'
 
-function statusMessage(fen) {
+function statusMessage(fen, thinking) {
+  if (thinking) return 'Bot thinking…'
   const status = getStatus(fen)
   if (status.kind === 'checkmate') {
     return status.winner === HUMAN ? 'Checkmate — you win' : 'Checkmate — bot wins'
@@ -30,33 +31,44 @@ function tryMove(fen, from, to) {
 
 export default function App() {
   const [fen, setFen] = useState(createGame)
+  const [thinking, setThinking] = useState(false)
 
-  function handleDrop({ from, to }) {
-    if (isGameOver(fen)) return false
+  // Warm up the ONNX session as soon as the page loads — saves a noticeable
+  // delay on the first bot move.
+  useEffect(() => {
+    preload().catch((err) => console.warn('AlphaZero preload failed', err))
+  }, [])
+
+  async function handleDrop({ from, to }) {
+    if (isGameOver(fen) || thinking) return false
 
     const afterHuman = tryMove(fen, from, to)
     if (afterHuman === null) return false
 
-    if (isGameOver(afterHuman)) {
-      setFen(afterHuman)
-      return true
-    }
+    setFen(afterHuman)
+    if (isGameOver(afterHuman)) return true
 
-    const botMove = bestMove(afterHuman)
-    setFen(applyMove(afterHuman, botMove))
+    setThinking(true)
+    try {
+      const botMove = await bestMove(afterHuman)
+      if (botMove) setFen(applyMove(afterHuman, botMove))
+    } finally {
+      setThinking(false)
+    }
     return true
   }
 
   function newGame() {
+    if (thinking) return
     setFen(createGame())
   }
 
   return (
     <main className="app">
       <h1>Chess</h1>
-      <Status message={statusMessage(fen)} />
+      <Status message={statusMessage(fen, thinking)} />
       <Board fen={fen} onDrop={handleDrop} />
-      <button className="new-game" onClick={newGame}>
+      <button className="new-game" onClick={newGame} disabled={thinking}>
         New Game
       </button>
     </main>
