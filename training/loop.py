@@ -1,7 +1,14 @@
-"""Training orchestrator: alternate self-play and SGD, export ONNX at the
-wall-clock milestones (15m / 1h / 4h by default), then exit."""
+"""Training orchestrator: alternate self-play and SGD.
+
+Two modes:
+  - Legacy milestone mode (--milestones): exits after all milestones hit.
+  - Indefinite mode (--snapshot-every, default): runs forever, saving an
+    immutable timestamped snapshot every N hours of cumulative training time.
+    Resumes automatically from latest.pt on restart (pm2-safe).
+"""
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -15,6 +22,18 @@ from net import ChessNet, N_BLOCKS, N_FILTERS, n_params
 from selfplay import play_batch
 from train import ReplayBuffer, train_step
 from export import export
+
+
+def parse_duration(spec):
+    """Parse a single duration string like '12h', '30m', '300s' into seconds."""
+    s = spec.strip()
+    if s.endswith("h"):
+        return float(s[:-1]) * 3600
+    elif s.endswith("m"):
+        return float(s[:-1]) * 60
+    elif s.endswith("s"):
+        return float(s[:-1])
+    return float(s)
 
 
 def parse_milestones(spec):
@@ -37,9 +56,17 @@ def parse_milestones(spec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default="checkpoints")
-    ap.add_argument("--milestones", default="15m,1h,4h",
-                    help="Comma-separated wall-clock milestones. Loop exits "
-                         "after the last one.")
+    ap.add_argument("--milestones", default=None,
+                    help="Legacy: comma-separated wall-clock milestones. "
+                         "Loop exits after the last one. Mutually exclusive "
+                         "with --snapshot-every.")
+    ap.add_argument("--snapshot-every", default="12h",
+                    help="Indefinite mode: save a snapshot every this interval "
+                         "of cumulative training time (e.g. 12h, 30m). "
+                         "Ignored when --milestones is set.")
+    ap.add_argument("--save-latest-every", default="300s",
+                    help="How often to write latest.pt (weights + optimizer + "
+                         "RNG + elapsed). Default 300s. Used for crash recovery.")
     ap.add_argument("--games-per-batch", type=int, default=32)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--buffer-capacity", type=int, default=200_000)
@@ -55,34 +82,102 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}", flush=True)
 
     net = ChessNet().to(device)
-    print(f"net: blocks={N_BLOCKS} filters={N_FILTERS} params={n_params(net):,}", flush=True)
-
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     buf = ReplayBuffer(args.buffer_capacity)
-    milestones = parse_milestones(args.milestones)
-    print(f"milestones: {milestones}", flush=True)
+    rng = np.random.default_rng(args.seed)
+
+    # --- Resume from latest.pt if present ---
+    base_elapsed = 0.0
+    total_games = 0
+    total_train_steps = 0
+    next_snapshot_at = 0.0  # cumulative seconds until next snapshot (indefinite mode)
+
+    latest_path = out_dir / "latest.pt"
+    if latest_path.exists():
+        ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["weights"])
+        opt.load_state_dict(ckpt["opt"])
+        base_elapsed = ckpt.get("elapsed_sec", 0.0)
+        total_games = ckpt.get("games", 0)
+        total_train_steps = ckpt.get("train_steps", 0)
+        next_snapshot_at = ckpt.get("next_snapshot_at", 0.0)
+        if "torch_rng" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng"])
+        if "np_rng" in ckpt:
+            rng.bit_generator.state = ckpt["np_rng"]
+        print(f"resumed from {latest_path} "
+              f"(elapsed={base_elapsed/3600:.2f}h games={total_games} "
+              f"steps={total_train_steps})", flush=True)
+    else:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"cold start (seed={args.seed})", flush=True)
+
+    print(f"net: blocks={N_BLOCKS} filters={N_FILTERS} params={n_params(net):,}", flush=True)
 
     start = time.time()
     last_log = start
-    next_milestone = 0
-    total_games = 0
-    total_train_steps = 0
-    rng = np.random.default_rng(args.seed)
+    last_latest_save = start
 
     def elapsed():
-        return time.time() - start
+        return base_elapsed + (time.time() - start)
 
-    def save_checkpoint(tag):
-        ckpt_path = out_dir / f"ckpt_{tag}.pt"
-        torch.save(
-            {
+    def _atomic_save(path, obj):
+        tmp = path.with_suffix(".tmp")
+        torch.save(obj, tmp)
+        tmp.replace(path)
+
+    def save_latest():
+        _atomic_save(latest_path, {
+            "weights": net.state_dict(),
+            "opt": opt.state_dict(),
+            "elapsed_sec": elapsed(),
+            "games": total_games,
+            "train_steps": total_train_steps,
+            "next_snapshot_at": next_snapshot_at,
+            "torch_rng": torch.get_rng_state(),
+            "np_rng": rng.bit_generator.state,
+            "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
+        })
+
+    def save_snapshot():
+        snap_dir = out_dir / "snapshots"
+        snap_dir.mkdir(exist_ok=True)
+        hours = int(elapsed() / 3600)
+        utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%MZ")
+        stem = f"snap_h{hours:05d}_{utc}"
+        pt_path = snap_dir / f"{stem}.pt"
+        onnx_path = snap_dir / f"{stem}.onnx"
+        _atomic_save(pt_path, {
+            "weights": net.state_dict(),
+            "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
+            "stats": {
+                "elapsed_sec": elapsed(),
+                "games": total_games,
+                "train_steps": total_train_steps,
+                "buffer_size": len(buf),
+            },
+        })
+        net.eval()
+        export(str(pt_path), str(onnx_path))
+        net.train()
+        print(f"[snapshot] {pt_path.name}  {onnx_path.name}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Legacy milestone mode
+    # -------------------------------------------------------------------------
+    if args.milestones is not None:
+        milestones = parse_milestones(args.milestones)
+        print(f"milestone mode: {milestones}", flush=True)
+        next_milestone = 0
+
+        def save_checkpoint(tag):
+            ckpt_path = out_dir / f"ckpt_{tag}.pt"
+            _atomic_save(ckpt_path, {
                 "weights": net.state_dict(),
                 "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
                 "stats": {
@@ -91,24 +186,89 @@ def main():
                     "train_steps": total_train_steps,
                     "buffer_size": len(buf),
                 },
-            },
-            ckpt_path,
-        )
-        onnx_path = out_dir / f"ckpt_{tag}.onnx"
-        net.eval()
-        export(str(ckpt_path), str(onnx_path))
+            })
+            onnx_path = out_dir / f"ckpt_{tag}.onnx"
+            net.eval()
+            export(str(ckpt_path), str(onnx_path))
+            net.train()
+            print(f"[{tag}] saved {ckpt_path} and {onnx_path}", flush=True)
+
         net.train()
-        print(f"[{tag}] saved {ckpt_path} and {onnx_path}", flush=True)
+        while True:
+            if next_milestone >= len(milestones):
+                print("all milestones hit, exiting", flush=True)
+                break
+            tag, deadline = milestones[next_milestone]
+            if elapsed() >= deadline:
+                save_checkpoint(tag)
+                next_milestone += 1
+                continue
+
+            cycle_start = time.time()
+            results, stats = play_batch(
+                net, device, args.games_per_batch, args.sims, rng=rng
+            )
+            buf.add_many(results)
+            total_games += stats["games"]
+            cycle_sp_time = time.time() - cycle_start
+
+            train_loss = None
+            if len(buf) >= args.min_buffer_for_train:
+                train_start = time.time()
+                losses = []
+                for _ in range(args.train_steps_per_cycle):
+                    batch = buf.sample(args.batch_size, rng=rng)
+                    if batch is None:
+                        break
+                    losses.append(train_step(net, opt, batch, device))
+                    total_train_steps += 1
+                cycle_tr_time = time.time() - train_start
+                if losses:
+                    train_loss = {
+                        "loss": float(np.mean([l["loss"] for l in losses])),
+                        "policy": float(np.mean([l["policy_loss"] for l in losses])),
+                        "value": float(np.mean([l["value_loss"] for l in losses])),
+                    }
+            else:
+                cycle_tr_time = 0.0
+
+            if time.time() - last_log >= args.log_every:
+                log = {
+                    "t": round(elapsed(), 1),
+                    "games": total_games,
+                    "buf": len(buf),
+                    "tr_steps": total_train_steps,
+                    "sp_sec": round(cycle_sp_time, 2),
+                    "tr_sec": round(cycle_tr_time, 2),
+                    "avg_plies": round(stats["avg_plies"], 1),
+                    "loss": train_loss,
+                    "next_ms": milestones[next_milestone][0],
+                }
+                print(json.dumps(log), flush=True)
+                last_log = time.time()
+        return
+
+    # -------------------------------------------------------------------------
+    # Indefinite mode (default)
+    # -------------------------------------------------------------------------
+    snapshot_interval = parse_duration(args.snapshot_every)
+    save_latest_interval = parse_duration(args.save_latest_every)
+
+    # Advance next_snapshot_at past already-elapsed intervals (e.g. after resume)
+    while next_snapshot_at <= elapsed():
+        next_snapshot_at += snapshot_interval
+
+    print(f"indefinite mode: snapshot every {args.snapshot_every} "
+          f"(next at elapsed={next_snapshot_at/3600:.2f}h)", flush=True)
 
     net.train()
     while True:
-        if next_milestone >= len(milestones):
-            print("all milestones hit, exiting", flush=True)
-            break
-        tag, deadline = milestones[next_milestone]
-        if elapsed() >= deadline:
-            save_checkpoint(tag)
-            next_milestone += 1
+        # Fire snapshot if due
+        if elapsed() >= next_snapshot_at:
+            save_snapshot()
+            save_latest()
+            last_latest_save = time.time()
+            next_snapshot_at += snapshot_interval
             continue
 
         cycle_start = time.time()
@@ -139,6 +299,11 @@ def main():
         else:
             cycle_tr_time = 0.0
 
+        # Periodically save latest.pt for crash recovery
+        if time.time() - last_latest_save >= save_latest_interval:
+            save_latest()
+            last_latest_save = time.time()
+
         if time.time() - last_log >= args.log_every:
             log = {
                 "t": round(elapsed(), 1),
@@ -149,7 +314,7 @@ def main():
                 "tr_sec": round(cycle_tr_time, 2),
                 "avg_plies": round(stats["avg_plies"], 1),
                 "loss": train_loss,
-                "next_ms": milestones[next_milestone][0],
+                "next_snap_in": round(next_snapshot_at - elapsed(), 1),
             }
             print(json.dumps(log), flush=True)
             last_log = time.time()
