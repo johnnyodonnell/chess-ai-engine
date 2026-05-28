@@ -29,7 +29,7 @@ with a single import in `src/App.jsx`.
 | Engine | Approach | Result |
 | --- | --- | --- |
 | Random | uniform-random legal move | ~300–500 ELO; loses every game to Stockfish at its weakest setting |
-| AlphaZero | small ResNet + MCTS, trained by self-play | visibly stronger than random; current checkpoint is 15 min of cold-start training |
+| AlphaZero | small ResNet + MCTS, trained by self-play | visibly stronger than random; current checkpoint is 1 h of cold-start training |
 
 ### Random — `src/engine/random.js`
 
