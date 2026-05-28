@@ -106,7 +106,7 @@ def main():
         total_train_steps = ckpt.get("train_steps", 0)
         next_snapshot_at = ckpt.get("next_snapshot_at", 0.0)
         if "torch_rng" in ckpt:
-            torch.set_rng_state(ckpt["torch_rng"])
+            torch.set_rng_state(ckpt["torch_rng"].cpu())
         if "np_rng" in ckpt:
             rng.bit_generator.state = ckpt["np_rng"]
         print(f"resumed from {latest_path} "
