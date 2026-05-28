@@ -80,3 +80,27 @@ training/                    Python self-play + training (run on asus-nvidia)
 public/
   models/current.onnx        the live AlphaZero checkpoint
 ```
+
+## Ongoing training & snapshots
+
+A long-running self-play process is running on `asus-nvidia` under pm2,
+saving a snapshot every 12 hours of cumulative training time.
+
+**Snapshots live at:** `~/chess-runs/run1/snapshots/` on `asus-nvidia`
+
+```sh
+# List available snapshots
+ssh asus-nvidia 'ls ~/chess-runs/run1/snapshots/'
+
+# Check training progress
+ssh asus-nvidia 'pm2 logs chess-train --lines 30 --nostream'
+
+# Try a snapshot locally — pick one from the list above, then:
+scp asus-nvidia:~/chess-runs/run1/snapshots/snap_h00024_<UTC>.onnx public/models/current.onnx
+npm run dev
+```
+
+Snapshot naming: `snap_h<NNNNN>_<YYYYMMDDTHHMMZ>.{pt,onnx}` where `h<NNNNN>`
+is cumulative hours trained (5-digit padded, persists across restarts).
+`latest.pt` in the same run dir holds the current weights + optimizer state
+for crash recovery.
