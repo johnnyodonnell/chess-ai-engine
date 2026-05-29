@@ -72,35 +72,52 @@ training/                    Python self-play + training (run on asus-nvidia)
   mcts.py                    batched PUCT for self-play
   selfplay.py                concurrent self-play games
   train.py                   loss + optimizer step
-  loop.py                    orchestrator (15m / 1h / 4h milestones)
+  loop.py                    orchestrator (indefinite self-play + snapshots)
   export.py                  PyTorch → ONNX
-  eval_stockfish.py          arena vs. Stockfish for ELO estimation
-  eval_random.py             pure-random baseline vs. Stockfish
+  evaluate.py                self-play Elo eval + anchor pool + model serving
 
 public/
   models/current.onnx        the live AlphaZero checkpoint
 ```
 
-## Ongoing training & snapshots
+## Ongoing training, evaluation & serving
 
-A long-running self-play process is running on `asus-nvidia` under pm2,
-saving a snapshot every 12 hours of cumulative training time.
+A long-running self-play process runs on `asus-nvidia` under pm2, saving a
+snapshot every **4 hours** of cumulative training time. After each snapshot a
+detached `evaluate.py` process plays the new snapshot against the active pool,
+fits a self-play Elo, and promotes the strongest model to `best.onnx`.
 
-**Snapshots live at:** `~/chess-runs/run1/snapshots/` on `asus-nvidia`
+Everything for a run lives in one folder in the repo:
+**`~/Workspace/chess-ai-engine/runs/run1/`** on `asus-nvidia`
+
+```
+runs/run1/
+  snapshots/                 immutable snap_h<NNNNN>_<UTC>.{pt,onnx}
+  latest.pt                  weights+optimizer+RNG+clock for crash recovery
+  best.onnx / best.pt        current strongest model (by self-play Elo)
+  pool.json                  models, ratings, accumulated match results
+  eval.log                   evaluation subprocess output
+```
 
 ```sh
-# List available snapshots
-ssh asus-nvidia 'ls ~/chess-runs/run1/snapshots/'
-
 # Check training progress
 ssh asus-nvidia 'pm2 logs chess-train --lines 30 --nostream'
 
-# Try a snapshot locally — pick one from the list above, then:
-scp asus-nvidia:~/chess-runs/run1/snapshots/snap_h00024_<UTC>.onnx public/models/current.onnx
+# Standings (ratings + which model is served)
+ssh asus-nvidia 'cat ~/Workspace/chess-ai-engine/runs/run1/pool.json'
+
+# Ship the current strongest model:
+scp asus-nvidia:~/Workspace/chess-ai-engine/runs/run1/best.onnx public/models/current.onnx
 npm run dev
 ```
 
-Snapshot naming: `snap_h<NNNNN>_<YYYYMMDDTHHMMZ>.{pt,onnx}` where `h<NNNNN>`
-is cumulative hours trained (5-digit padded, persists across restarts).
-`latest.pt` in the same run dir holds the current weights + optimizer state
-for crash recovery.
+**Evaluation:** the pool holds 8 active models — the 3 top performers plus 5
+anchors (a fixed random player pinned at Elo 0 and 4 frozen ex-snapshots spread
+across the strength range below the top 3). Ratings are a lightweight Elo fit
+over accumulated match results with random pinned at 0 — purely self-play, no
+external engine. The frozen anchors keep the scale from drifting and catch
+regression. `best.onnx` only changes when a model beats the incumbent by a
+confidence margin.
+
+Snapshot naming: `snap_h<NNNNN>_<YYYYMMDDTHHMMZ>.{pt,onnx}` where `h<NNNNN>` is
+cumulative hours trained (5-digit padded, persists across restarts).

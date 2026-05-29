@@ -11,6 +11,7 @@ import argparse
 import datetime
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -60,10 +61,15 @@ def main():
                     help="Legacy: comma-separated wall-clock milestones. "
                          "Loop exits after the last one. Mutually exclusive "
                          "with --snapshot-every.")
-    ap.add_argument("--snapshot-every", default="12h",
+    ap.add_argument("--snapshot-every", default="4h",
                     help="Indefinite mode: save a snapshot every this interval "
-                         "of cumulative training time (e.g. 12h, 30m). "
+                         "of cumulative training time (e.g. 4h, 30m). "
                          "Ignored when --milestones is set.")
+    ap.add_argument("--init-from", default=None,
+                    help="Warm-start a fresh run: load weights+optimizer from "
+                         "this checkpoint but keep the clock/counters/snapshot "
+                         "schedule at zero. Only used on a cold start (when no "
+                         "latest.pt exists in --out-dir).")
     ap.add_argument("--save-latest-every", default="300s",
                     help="How often to write latest.pt (weights + optimizer + "
                          "RNG + elapsed). Default 300s. Used for crash recovery.")
@@ -82,6 +88,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    snapshot_interval = parse_duration(args.snapshot_every)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device}", flush=True)
 
@@ -95,6 +103,7 @@ def main():
     total_games = 0
     total_train_steps = 0
     next_snapshot_at = 0.0  # cumulative seconds until next snapshot (indefinite mode)
+    loaded_interval = None  # snapshot interval recorded in the resumed checkpoint
 
     latest_path = out_dir / "latest.pt"
     if latest_path.exists():
@@ -105,6 +114,7 @@ def main():
         total_games = ckpt.get("games", 0)
         total_train_steps = ckpt.get("train_steps", 0)
         next_snapshot_at = ckpt.get("next_snapshot_at", 0.0)
+        loaded_interval = ckpt.get("snapshot_interval")
         if "torch_rng" in ckpt:
             torch.set_rng_state(ckpt["torch_rng"].cpu())
         if "np_rng" in ckpt:
@@ -112,6 +122,18 @@ def main():
         print(f"resumed from {latest_path} "
               f"(elapsed={base_elapsed/3600:.2f}h games={total_games} "
               f"steps={total_train_steps})", flush=True)
+    elif args.init_from:
+        ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        net.load_state_dict(ckpt["weights"])
+        if "opt" in ckpt:
+            try:
+                opt.load_state_dict(ckpt["opt"])
+            except (ValueError, KeyError) as e:
+                print(f"warn: skipped optimizer state from --init-from ({e})", flush=True)
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"warm start from {args.init_from} "
+              f"(weights+optimizer, fresh clock; seed={args.seed})", flush=True)
     else:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
@@ -139,6 +161,7 @@ def main():
             "games": total_games,
             "train_steps": total_train_steps,
             "next_snapshot_at": next_snapshot_at,
+            "snapshot_interval": snapshot_interval,
             "torch_rng": torch.get_rng_state(),
             "np_rng": rng.bit_generator.state,
             "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
@@ -166,6 +189,44 @@ def main():
         export(str(pt_path), str(onnx_path))
         net.train()
         print(f"[snapshot] {pt_path.name}  {onnx_path.name}", flush=True)
+        return pt_path
+
+    def _pid_alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def launch_eval(pt_path):
+        """Fire evaluate.py as a detached subprocess. Overlap-guarded by
+        eval.lock so a hung eval never spawns a second one."""
+        lock = out_dir / "eval.lock"
+        if lock.exists():
+            try:
+                prev_pid = int(lock.read_text().split()[0])
+                if _pid_alive(prev_pid):
+                    print(f"[eval] prior eval (pid {prev_pid}) still running; "
+                          f"skipping {pt_path.name}", flush=True)
+                    return
+            except (ValueError, IndexError, OSError):
+                pass  # stale/garbled lock — overwrite below
+        training_dir = Path(__file__).resolve().parent
+        logf = open(out_dir / "eval.log", "a")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "evaluate.py",
+                 "--run-dir", str(out_dir), "--candidate", str(pt_path)],
+                cwd=str(training_dir), stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            logf.close()
+        lock.write_text(f"{proc.pid} {time.time()}")
+        print(f"[eval] launched evaluate.py pid={proc.pid} for {pt_path.name}",
+              flush=True)
 
     # -------------------------------------------------------------------------
     # Legacy milestone mode
@@ -251,8 +312,15 @@ def main():
     # -------------------------------------------------------------------------
     # Indefinite mode (default)
     # -------------------------------------------------------------------------
-    snapshot_interval = parse_duration(args.snapshot_every)
     save_latest_interval = parse_duration(args.save_latest_every)
+
+    # If the snapshot interval changed across a restart, realign to the new grid
+    # so the new cadence takes effect immediately rather than honoring a stale
+    # next_snapshot_at computed under the old interval.
+    if loaded_interval is not None and abs(loaded_interval - snapshot_interval) > 1e-6:
+        next_snapshot_at = (int(elapsed() // snapshot_interval) + 1) * snapshot_interval
+        print(f"snapshot interval changed {loaded_interval}s -> {snapshot_interval}s; "
+              f"realigned next snapshot to elapsed={next_snapshot_at/3600:.2f}h", flush=True)
 
     # Advance next_snapshot_at past already-elapsed intervals (e.g. after resume)
     while next_snapshot_at <= elapsed():
@@ -265,10 +333,11 @@ def main():
     while True:
         # Fire snapshot if due
         if elapsed() >= next_snapshot_at:
-            save_snapshot()
+            pt_path = save_snapshot()
             save_latest()
             last_latest_save = time.time()
             next_snapshot_at += snapshot_interval
+            launch_eval(pt_path)
             continue
 
         cycle_start = time.time()

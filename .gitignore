@@ -8,3 +8,6 @@ training/__pycache__/
 training/checkpoints/
 training/data/
 training/logs/
+
+# Self-play run output (snapshots, latest.pt, pool.json, best.onnx, logs).
+runs/
