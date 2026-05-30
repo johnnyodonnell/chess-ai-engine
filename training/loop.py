@@ -23,6 +23,7 @@ from net import ChessNet, N_BLOCKS, N_FILTERS, n_params
 from selfplay import play_batch
 from train import ReplayBuffer, train_step
 from export import export
+from evaluator import LocalEvaluator
 
 
 def parse_duration(spec):
@@ -97,6 +98,8 @@ def main():
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     buf = ReplayBuffer(args.buffer_capacity)
     rng = np.random.default_rng(args.seed)
+    # Legacy single-process self-play scores leaves with the net in-process.
+    evaluator = LocalEvaluator(net, device)
 
     # --- Resume from latest.pt if present ---
     base_elapsed = 0.0
@@ -267,7 +270,7 @@ def main():
 
             cycle_start = time.time()
             results, stats = play_batch(
-                net, device, args.games_per_batch, args.sims, rng=rng
+                evaluator, args.games_per_batch, args.sims, rng=rng
             )
             buf.add_many(results)
             total_games += stats["games"]

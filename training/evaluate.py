@@ -26,6 +26,7 @@ import chess
 import numpy as np
 import torch
 
+from evaluator import LocalEvaluator
 from export import export
 from mcts import Node, run_simulations, sample_move
 from net import ChessNet
@@ -61,13 +62,14 @@ class NetPlayer:
         ).to(device)
         self.net.load_state_dict(state["weights"])
         self.net.eval()
+        self.evaluator = LocalEvaluator(self.net, device)
 
     def select_moves(self, boards, plies, opening_plies, rng):
         # Fresh tree per move (no reuse) — simpler and fine for eval volumes.
         holders = [
             SimpleNamespace(board=b, root=Node(), done=False) for b in boards
         ]
-        run_simulations(holders, self.net, self.device, self.sims, add_root_noise=False)
+        run_simulations(holders, self.evaluator, self.sims, add_root_noise=False)
         out = []
         for h, ply in zip(holders, plies):
             temp = OPENING_TEMP if ply < opening_plies else 0.0

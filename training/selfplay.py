@@ -1,10 +1,10 @@
-"""Batched self-play: run N concurrent games sharing a single net for
+"""Batched self-play: run N concurrent games sharing a single evaluator for
 batched leaf evaluations. Emits training tuples (state, policy_pi, z)
-into a replay buffer."""
+into a replay buffer. Pure CPU/numpy (no torch import) so it can run in
+torch-free self-play workers driving a RemoteEvaluator."""
 
 import chess
 import numpy as np
-import torch
 
 from encode import POLICY_SIZE, encode_position
 from mcts import Node, run_simulations, sample_move, visits_to_pi
@@ -43,9 +43,10 @@ def _finalize(game):
     return out
 
 
-def play_batch(net, device, n_games, n_sims, rng=None):
+def play_batch(evaluator, n_games, n_sims, rng=None):
     """Run `n_games` self-play games to completion. Returns a flat list of
-    (state, pi, z) tuples for the replay buffer, plus per-game stats."""
+    (state, pi, z) tuples for the replay buffer, plus per-game stats.
+    Leaf evaluations are batched across all active games through `evaluator`."""
     rng = rng or np.random
     games = [GameRunner() for _ in range(n_games)]
     results = []
@@ -54,7 +55,7 @@ def play_batch(net, device, n_games, n_sims, rng=None):
 
     while any(not g.done for g in games):
         active = [g for g in games if not g.done]
-        run_simulations(active, net, device, n_sims, add_root_noise=True)
+        run_simulations(active, evaluator, n_sims, add_root_noise=True)
 
         for g in active:
             pi = visits_to_pi(g.root, g.board, temperature=g.temperature())
@@ -85,3 +86,31 @@ def play_batch(net, device, n_games, n_sims, rng=None):
                 total_plies += len(g.history)
 
     return results, {"games": n_completed, "avg_plies": total_plies / max(1, n_completed)}
+
+
+def run_worker(channel, out_queue, stop_event, seed, games_per_worker, sims):
+    """Self-play worker process entrypoint (torch-free, CPU-only).
+
+    Generates games via a RemoteEvaluator that ships leaf positions to the
+    central InferenceServer over `channel`, and pushes each finished batch —
+    (results, n_games, avg_plies) — onto `out_queue` for the trainer to drain.
+    The bounded queue applies backpressure: if the trainer falls behind, put()
+    blocks here rather than growing memory.
+    """
+    import os
+    import queue as _queue
+
+    from evaluator import RemoteEvaluator
+
+    rng = np.random.default_rng(seed)
+    evaluator = RemoteEvaluator(channel)
+    # Exit if orphaned (parent hard-killed without setting stop_event).
+    while not stop_event.is_set() and os.getppid() != 1:
+        results, stats = play_batch(evaluator, games_per_worker, sims, rng=rng)
+        item = (results, stats["games"], stats["avg_plies"])
+        while not stop_event.is_set():
+            try:
+                out_queue.put(item, timeout=0.5)
+                break
+            except _queue.Full:
+                pass

@@ -1,14 +1,15 @@
 """PUCT MCTS over batched parallel games for self-play data generation.
 
 Each call to `run_simulations` advances all N games' trees by `n_sims`
-simulations. Leaves from all games are gathered into a single GPU batch
-per simulation step, which is the only way to get reasonable throughput
-out of one GB10 for tiny nets.
+simulations. Leaves from all games are gathered into a single batch per
+simulation step and scored through an `Evaluator` (see evaluator.py), which
+batches them onto the GPU — the only way to get reasonable throughput out of
+one GB10 for tiny nets. This module is pure CPU/numpy (no torch import) so
+self-play workers stay lightweight.
 """
 
 import math
 import numpy as np
-import torch
 
 from encode import (
     POLICY_SIZE,
@@ -115,17 +116,14 @@ def _backprop(path, value):
         v = -v
 
 
-def run_simulations(games, net, device, n_sims, add_root_noise=False):
-    """Advance each game's MCTS tree by `n_sims` simulations, batching net
-    evaluations across all games."""
+def run_simulations(games, evaluator, n_sims, add_root_noise=False):
+    """Advance each game's MCTS tree by `n_sims` simulations, batching leaf
+    evaluations across all games through `evaluator` (see evaluator.py)."""
     # Ensure root is expanded for each game (single pass, batched).
     needs_expand = [g for g in games if g.root is not None and not g.root.expanded]
     if needs_expand:
         positions = np.stack([encode_position(g.board) for g in needs_expand])
-        with torch.no_grad():
-            pos_t = torch.from_numpy(positions).to(device)
-            logits, _ = net(pos_t)
-            logits = logits.float().cpu().numpy()
+        logits, _ = evaluator.evaluate(positions)
         for g, logit in zip(needs_expand, logits):
             _expand_node(g.root, g.board, logit)
 
@@ -151,11 +149,7 @@ def run_simulations(games, net, device, n_sims, add_root_noise=False):
         eval_slots = [(i, lf) for i, lf in enumerate(leaves) if lf[3] is None]
         if eval_slots:
             positions = np.stack([encode_position(lf[2]) for _, lf in eval_slots])
-            with torch.no_grad():
-                pos_t = torch.from_numpy(positions).to(device)
-                logits, values = net(pos_t)
-                logits = logits.float().cpu().numpy()
-                values = values.float().cpu().numpy()
+            logits, values = evaluator.evaluate(positions)
         else:
             logits, values = None, None
 
