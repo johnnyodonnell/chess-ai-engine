@@ -25,7 +25,7 @@ exec "$VENV/bin/python" orchestrator.py \
   --snapshot-every 4h \
   --save-latest-every 300s \
   --out-dir "$OUT_DIR" \
-  --workers "${WORKERS:-16}" \
+  --workers "${WORKERS:-20}" \
   --games-per-worker "${GAMES_PER_WORKER:-16}" \
   --sims "${SIMS:-200}" \
   "${INIT_ARGS[@]}"
