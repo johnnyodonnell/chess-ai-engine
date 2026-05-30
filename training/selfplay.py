@@ -10,10 +10,15 @@ from encode import POLICY_SIZE, encode_position
 from mcts import Node, run_simulations, sample_move, visits_to_pi
 
 
-# Temperature schedule: high exploration for the opening, deterministic after.
+# Temperature schedule: full exploration in the opening, then ANNEAL toward a
+# nonzero floor — never fully deterministic. A hard cut to 0 made both sides
+# play argmax of a near-uniform policy and shuffle into threefold-repetition
+# draws every game (z=0 everywhere → no learning signal: the draw collapse).
+# Keeping temperature > 0 throughout keeps games decisive and learnable.
 TEMPERATURE_OPENING = 1.0
-TEMPERATURE_MOVES = 20  # plies of high-temp play
-TEMPERATURE_LATE = 0.0
+TEMPERATURE_MOVES = 20         # plies of full-temperature (1.0) opening play
+TEMPERATURE_FLOOR = 0.35       # self-play never goes below this (never argmax)
+TEMPERATURE_ANNEAL_MOVES = 40  # plies to anneal from opening temp down to floor
 MAX_PLIES = 256
 
 
@@ -26,11 +31,11 @@ class GameRunner:
         self.result = None  # +1 white wins, -1 black wins, 0 draw
 
     def temperature(self):
-        return (
-            TEMPERATURE_OPENING
-            if len(self.history) < TEMPERATURE_MOVES
-            else TEMPERATURE_LATE
-        )
+        ply = len(self.history)
+        if ply < TEMPERATURE_MOVES:
+            return TEMPERATURE_OPENING
+        frac = min(1.0, (ply - TEMPERATURE_MOVES) / TEMPERATURE_ANNEAL_MOVES)
+        return TEMPERATURE_OPENING + frac * (TEMPERATURE_FLOOR - TEMPERATURE_OPENING)
 
 
 def _finalize(game):

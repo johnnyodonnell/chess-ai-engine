@@ -22,7 +22,7 @@ fi
 
 cd "$REPO_DIR/training"
 exec "$VENV/bin/python" orchestrator.py \
-  --snapshot-every 4h \
+  --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --save-latest-every 300s \
   --out-dir "$OUT_DIR" \
   --workers "${WORKERS:-20}" \
