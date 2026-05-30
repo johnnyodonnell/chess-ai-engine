@@ -203,9 +203,26 @@ def main():
             return False
         except PermissionError:
             return True
+        # A finished-but-unreaped child lingers as a zombie whose PID-table
+        # entry keeps os.kill(pid, 0) succeeding even though it has exited.
+        # Treat zombies as dead, otherwise a stale lock blocks every future
+        # eval forever.
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+            state = data[data.rindex(")") + 1:].split()[0]
+            if state == "Z":
+                return False
+        except (OSError, ValueError, IndexError):
+            pass
         return True
 
     def launch_eval(pt_path):
+        # Reap the previous eval if it has finished, so it doesn't linger as a
+        # zombie (parent never exits) and trip the staleness check below.
+        prev = launch_eval.proc
+        if prev is not None and prev.poll() is not None:
+            launch_eval.proc = None
         lock = out_dir / "eval.lock"
         if lock.exists():
             try:
@@ -227,9 +244,12 @@ def main():
             )
         finally:
             logf.close()
+        launch_eval.proc = proc
         lock.write_text(f"{proc.pid} {time.time()}")
         print(f"[eval] launched evaluate.py pid={proc.pid} for {pt_path.name}",
               flush=True)
+
+    launch_eval.proc = None
 
     # ----- Spawn inference server + self-play workers -----
     publish_weights()  # initial: server needs a weights file to load
