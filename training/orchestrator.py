@@ -64,11 +64,13 @@ def parse_args():
     ap.add_argument("--buffer-capacity", type=int, default=200_000)
     ap.add_argument("--min-buffer-for-train", type=int, default=2_000)
     ap.add_argument("--batch-size", type=int, default=256)
-    ap.add_argument("--target-reuse", type=float, default=6.0,
+    ap.add_argument("--target-reuse", type=float, default=4.0,
                     help="Avg times each generated sample is used in training. "
                          "Paces SGD to the self-play data rate so the trainer "
-                         "doesn't starve the inference server of GPU "
-                         "(loop.py's implicit ratio was ~6.7).")
+                         "doesn't starve the inference server of GPU, and bounds "
+                         "overfitting. 4 follows KataGo's tuned cap (<=4/row); "
+                         "AlphaZero used ~0.5 (compute-rich), Leela ~10 (flagged "
+                         "as over-sampling). loop.py's implicit ratio was ~6.7.")
     ap.add_argument("--max-steps-per-cycle", type=int, default=64,
                     help="Cap on SGD steps per loop iteration (smooths bursts).")
     ap.add_argument("--lr", type=float, default=2e-3)
