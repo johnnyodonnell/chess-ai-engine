@@ -19,6 +19,7 @@ use numpy::{
     IntoPyArray, PyArray1, PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Dirichlet, Distribution};
@@ -337,6 +338,18 @@ impl MctsEngine {
             self.results.push((state, pi, z));
         }
     }
+
+    /// Replace every finished game with a fresh start-position game (steady
+    /// game-refill: keeps the in-flight batch full instead of shrinking to a
+    /// thin tail as games finish). The shared engine rng keeps advancing, so
+    /// the stream stays deterministic for a given seed.
+    fn refill_done(&mut self) {
+        for g in self.games.iter_mut() {
+            if g.done {
+                *g = Game::from_board(Board::new());
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -539,6 +552,60 @@ impl MctsEngine {
                 (s, p, z)
             })
             .collect()
+    }
+
+    /// Drive the entire self-play loop in Rust (option B — in-process forward).
+    ///
+    /// `forward(batch)` is a Python callable taking an (M,18,8,8) f32 ndarray
+    /// and returning (logits[M,4672] f32, values[M] f32). It is the ONLY
+    /// crossing back into Python — the in-process GPU forward. `result_sink(rows)`
+    /// receives a list of finished (state(18,8,8), pi(4672,), z) tuples after
+    /// each move cycle (push them onto the trainer queue). `stop()` returns True
+    /// to end the loop (orphan/parent-death + shutdown checks live there).
+    ///
+    /// refill=True: run until `stop`, refilling finished games so the batch stays
+    /// full. refill=False: stop when every game is done (the equivalence test).
+    fn run(
+        &mut self,
+        py: Python<'_>,
+        forward: PyObject,
+        result_sink: PyObject,
+        stop: PyObject,
+        refill: bool,
+    ) -> PyResult<()> {
+        loop {
+            // Inner micro-loop: feed every NN batch this cycle needs through the
+            // in-process forward. This is the ~sims-per-ply hot path (the ~23k
+            // round-trips/game that used to cross the process boundary).
+            loop {
+                let batch = match self.pending_positions(py) {
+                    Some(b) => b,
+                    None => break,
+                };
+                let out = forward.call1(py, (batch,))?;
+                let bound = out.bind(py);
+                let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
+                    bound.extract()?;
+                self.apply_evals(logits, values);
+            }
+            self.step_moves();
+
+            if !self.results.is_empty() {
+                let rows = self.take_results(py);
+                let list = PyList::new(py, rows)?;
+                result_sink.call1(py, (list,))?;
+            }
+
+            if refill {
+                self.refill_done();
+            } else if self.all_done() {
+                break;
+            }
+            if stop.call0(py)?.bind(py).extract::<bool>()? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     // ---- parity / eval accessors ----
