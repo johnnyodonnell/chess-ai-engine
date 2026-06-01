@@ -92,7 +92,13 @@ class PyBoard:
 # native Board, so it shares the `rust` board path here.
 USE_RUST_ENGINE = BACKEND == "rust_mcts"
 
-if BACKEND in ("rust", "rust_mcts"):
+# rust_inproc: a single self-play process drives the native MctsEngine.run loop
+# entirely in Rust, calling the torch net IN-PROCESS for the forward (no shm /
+# inference server / spin-wait). See selfplay.run_selfplay_inproc. Shares the
+# native `rust` board path.
+USE_INPROC_ENGINE = BACKEND == "rust_inproc"
+
+if BACKEND in ("rust", "rust_mcts", "rust_inproc"):
     import chess_rs
 
     _Board = chess_rs.Board

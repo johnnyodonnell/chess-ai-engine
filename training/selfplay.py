@@ -138,3 +138,75 @@ def run_worker(channel, out_queue, stop_event, seed, games_per_worker, sims):
                 break
             except _queue.Full:
                 pass
+
+
+def run_selfplay_inproc(out_queue, stop_event, seed, n_games, sims, weights_path,
+                        device_str="cuda", reload_every=5.0):
+    """In-process self-play process (CHESS_BACKEND=rust_inproc, option B).
+
+    The whole self-play loop runs inside the native MctsEngine (chess_rs.run):
+    Rust owns the games/tree/refill and calls back into Python ONLY for the GPU
+    forward, which we run on the net held in THIS process — no inference server,
+    no shared-memory channels, no spin-wait. Finished (state, pi, z) rows are
+    pushed onto the bounded `out_queue` for the trainer (same contract as
+    run_worker: (rows, n_games, avg_plies)); a full queue blocks here, applying
+    backpressure. Weights are reloaded from `weights_path` on mtime change, the
+    same way the inference server picks up the trainer's publishes.
+    """
+    import os
+    import queue as _queue
+    import time
+
+    import torch
+
+    import chess_rs
+    from net import ChessNet
+
+    use_cuda = device_str == "cuda" and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    def load_net(path):
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        cfg = ckpt.get("config", {})
+        net = ChessNet(n_blocks=cfg.get("n_blocks"),
+                       n_filters=cfg.get("n_filters")).to(device)
+        net.load_state_dict(ckpt["weights"])
+        net.eval()
+        return net
+
+    state = {"net": load_net(weights_path),
+             "mtime": os.path.getmtime(weights_path),
+             "last_check": time.time()}
+
+    @torch.no_grad()
+    def forward(batch):
+        now = time.time()
+        if now - state["last_check"] >= reload_every:
+            state["last_check"] = now
+            try:
+                m = os.path.getmtime(weights_path)
+                if m > state["mtime"]:
+                    state["net"] = load_net(weights_path)
+                    state["mtime"] = m
+            except (OSError, KeyError):
+                pass  # mid-write / transient — retry next check
+        x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
+        logits, values = state["net"](x)
+        return logits.float().cpu().numpy(), values.float().cpu().numpy()
+
+    def sink(rows, n_finished):
+        item = (rows, n_finished, len(rows) / max(1, n_finished))
+        # Backpressure: block until the trainer drains, or we're told to stop.
+        while not should_stop():
+            try:
+                out_queue.put(item, timeout=0.5)
+                return
+            except _queue.Full:
+                pass
+
+    def should_stop():
+        # Exit on shutdown or if orphaned (parent hard-killed).
+        return stop_event.is_set() or os.getppid() == 1
+
+    engine = chess_rs.MctsEngine(n_games, sims, seed, True)
+    engine.run(forward, sink, should_stop, True)  # refill=True: run until stop

@@ -8,11 +8,13 @@
 # Rollback: swap `orchestrator.py ...` back to `loop.py --snapshot-every 4h
 # --save-latest-every 300s --out-dir "$OUT_DIR"` and restart.
 #
-# Self-play backend: native Rust MCTS engine (chess_rs, CHESS_BACKEND=rust_mcts)
-# by default — bit-exact with the Python MCTS (test_mcts_parity.py) but runs the
-# whole search in Rust. Instant rollback: start with CHESS_BACKEND=rust (Rust
-# board + Python MCTS) or CHESS_BACKEND=python (python-chess reference), e.g.
-# `CHESS_BACKEND=rust pm2 restart chess-train --update-env`.
+# Self-play backend: in-process native engine (chess_rs, CHESS_BACKEND=rust_inproc)
+# by default — one self-play process runs the whole MctsEngine.run loop in Rust
+# and does the GPU forward IN-PROCESS (no inference server, no shm channels, no
+# spin-wait). Bit-identical games to rust_mcts (test_rust_inproc.py); A/B showed
+# throughput parity at ~1/10 the CPU (no spin). Instant rollback to the previous
+# path: `CHESS_BACKEND=rust_mcts pm2 restart chess-train --update-env` (server +
+# workers + spin-wait), or rust / python for the reference paths.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +28,7 @@ if [[ -n "${INIT_FROM:-}" ]]; then
   INIT_ARGS=(--init-from "$INIT_FROM")
 fi
 
-export CHESS_BACKEND="${CHESS_BACKEND:-rust_mcts}"
+export CHESS_BACKEND="${CHESS_BACKEND:-rust_inproc}"
 
 # Self-play concurrency + IPC. rust_mcts makes a worker's per-sim CPU work
 # negligible, so workers fall into a lockstep "convoy" on the central GPU
@@ -40,7 +42,13 @@ export CHESS_BACKEND="${CHESS_BACKEND:-rust_mcts}"
 # -> 27k; gpw=16 + spin (12 workers) -> 67k pos/s (and small gpw = good replay
 # diversity, no warmup). So rust_mcts uses small gpw + spin-wait; the slower
 # paths (python / rust board) pipeline via their own CPU jitter and don't spin.
-if [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
+if [[ "$CHESS_BACKEND" == "rust_inproc" ]]; then
+  # Option B: a single self-play process runs MctsEngine.run entirely in Rust
+  # and does the forward IN-PROCESS (no inference server, no shm, no spin-wait).
+  # games-in-flight (the NN batch width) = WORKERS * GAMES_PER_WORKER.
+  DEFAULT_GPW=16
+  DEFAULT_WORKERS=12
+elif [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
   DEFAULT_GPW=16
   DEFAULT_WORKERS=12
   # Hybrid spin-wait: worker busy-checks the response for INFER_SPIN_US us before

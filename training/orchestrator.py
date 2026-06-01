@@ -28,8 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
+from chess_backend import USE_INPROC_ENGINE
 from evaluator import make_channels, unlink_blocks
-from selfplay import run_worker
+from selfplay import run_selfplay_inproc, run_worker
 
 
 def parse_duration(spec):
@@ -251,40 +252,64 @@ def main():
 
     launch_eval.proc = None
 
-    # ----- Spawn inference server + self-play workers -----
-    publish_weights()  # initial: server needs a weights file to load
+    # ----- Spawn self-play (+ inference server, unless in-process) -----
+    publish_weights()  # initial: the net source the self-play side loads/reloads
 
     ctx = mp.get_context("spawn")
-    channels, blocks = make_channels(ctx, args.workers, args.games_per_worker)
     out_queue = ctx.Queue(maxsize=args.queue_max)
     stop = ctx.Event()
-    server_ready = ctx.Event()
 
-    def start_server():
-        server_ready.clear()
-        p = ctx.Process(
-            target=run_server,
-            args=(channels, str(serving_path), stop, str(device)),
-            kwargs={"ready_event": server_ready},
-        )
-        p.start()
-        if not server_ready.wait(180):
-            print("warn: inference server slow to report ready", flush=True)
-        return p
+    if USE_INPROC_ENGINE:
+        # Option B: ONE self-play process runs the whole MctsEngine.run loop and
+        # does the forward in-process — no inference server, no shm channels, no
+        # spin-wait. Total games-in-flight (the NN batch width) = workers * gpw,
+        # so the existing concurrency knobs carry over.
+        channels, blocks = [], []
+        n_inproc_games = args.workers * args.games_per_worker
 
-    def start_worker(idx):
-        p = ctx.Process(
-            target=run_worker,
-            args=(channels[idx], out_queue, stop, args.seed + 1000 + idx,
-                  args.games_per_worker, args.sims),
-        )
-        p.start()
-        return p
+        def start_selfplay():
+            p = ctx.Process(
+                target=run_selfplay_inproc,
+                args=(out_queue, stop, args.seed + 1000, n_inproc_games,
+                      args.sims, str(serving_path), str(device)),
+            )
+            p.start()
+            return p
 
-    server_proc = start_server()
-    workers = [start_worker(i) for i in range(args.workers)]
-    print(f"spawned 1 inference server + {args.workers} workers "
-          f"(games/worker={args.games_per_worker} sims={args.sims})", flush=True)
+        selfplay_proc = start_selfplay()
+        server_proc, workers = None, []
+        print(f"spawned 1 in-process self-play process (games={n_inproc_games} "
+              f"sims={args.sims}); no inference server", flush=True)
+    else:
+        channels, blocks = make_channels(ctx, args.workers, args.games_per_worker)
+        server_ready = ctx.Event()
+
+        def start_server():
+            server_ready.clear()
+            p = ctx.Process(
+                target=run_server,
+                args=(channels, str(serving_path), stop, str(device)),
+                kwargs={"ready_event": server_ready},
+            )
+            p.start()
+            if not server_ready.wait(180):
+                print("warn: inference server slow to report ready", flush=True)
+            return p
+
+        def start_worker(idx):
+            p = ctx.Process(
+                target=run_worker,
+                args=(channels[idx], out_queue, stop, args.seed + 1000 + idx,
+                      args.games_per_worker, args.sims),
+            )
+            p.start()
+            return p
+
+        server_proc = start_server()
+        workers = [start_worker(i) for i in range(args.workers)]
+        selfplay_proc = None
+        print(f"spawned 1 inference server + {args.workers} workers "
+              f"(games/worker={args.games_per_worker} sims={args.sims})", flush=True)
 
     # ----- Clock / snapshot schedule (mirror loop.py) -----
     start = time.time()
@@ -312,13 +337,18 @@ def main():
     try:
         while True:
             # Supervise children — restart any that died.
-            if not server_proc.is_alive():
-                print("warn: inference server died; restarting", flush=True)
-                server_proc = start_server()
-            for i, p in enumerate(workers):
-                if not p.is_alive():
-                    print(f"warn: worker {i} died; restarting", flush=True)
-                    workers[i] = start_worker(i)
+            if USE_INPROC_ENGINE:
+                if not selfplay_proc.is_alive():
+                    print("warn: in-process self-play died; restarting", flush=True)
+                    selfplay_proc = start_selfplay()
+            else:
+                if not server_proc.is_alive():
+                    print("warn: inference server died; restarting", flush=True)
+                    server_proc = start_server()
+                for i, p in enumerate(workers):
+                    if not p.is_alive():
+                        print(f"warn: worker {i} died; restarting", flush=True)
+                        workers[i] = start_worker(i)
 
             # Snapshot if due.
             if elapsed() >= next_snapshot_at:
@@ -406,9 +436,10 @@ def main():
     finally:
         print("shutting down: signaling workers + server", flush=True)
         stop.set()
-        for p in workers + [server_proc]:
+        procs = [selfplay_proc] if USE_INPROC_ENGINE else workers + [server_proc]
+        for p in procs:
             p.join(timeout=10)
-        for p in workers + [server_proc]:
+        for p in procs:
             if p.is_alive():
                 p.terminate()
         unlink_blocks(blocks)
