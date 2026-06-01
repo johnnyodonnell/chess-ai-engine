@@ -11,12 +11,7 @@ self-play workers stay lightweight.
 import math
 import numpy as np
 
-from encode import (
-    POLICY_SIZE,
-    encode_position,
-    legal_move_mask,
-    move_to_index,
-)
+from encode import POLICY_SIZE
 
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
@@ -24,7 +19,8 @@ DIRICHLET_EPS = 0.25  # mix weight at the root during self-play
 
 
 class Node:
-    __slots__ = ("prior", "visit_count", "value_sum", "children", "expanded", "noised")
+    __slots__ = ("prior", "visit_count", "value_sum", "children", "expanded",
+                 "noised", "move_index")
 
     def __init__(self, prior=0.0):
         self.prior = prior
@@ -33,6 +29,7 @@ class Node:
         self.children = {}
         self.expanded = False
         self.noised = False
+        self.move_index = -1  # AZ policy index of the move leading to this node
 
     @property
     def q(self):
@@ -53,30 +50,21 @@ def _select_child(node):
     return best_move, best_child
 
 
-def _terminal_value_for_side_to_move(board):
-    """Return +1/0/-1 from the side-to-move's POV if game is over, else None."""
-    if not board.is_game_over(claim_draw=True):
-        return None
-    outcome = board.outcome(claim_draw=True)
-    if outcome.winner is None:
-        return 0.0
-    # If game is over with a winner, the current side-to-move has just been
-    # mated (no legal moves), so value is -1 for them.
-    return -1.0
-
-
 def _expand_node(node, board, policy_logits):
-    """Mask illegal moves, softmax over legal ones, attach child priors."""
-    mask = legal_move_mask(board)
-    masked = np.where(mask, policy_logits, -1e9)
-    masked -= masked.max()
-    exp = np.exp(masked)
-    exp = exp * mask
-    total = exp.sum()
-    priors = exp / total if total > 0 else exp
-    for move in board.legal_moves:
-        idx = move_to_index(move, board)
-        node.children[move] = Node(prior=float(priors[idx]))
+    """Softmax the policy over this position's legal moves and attach child
+    priors, keyed by move handle (an opaque backend token). Each child records
+    its AlphaZero policy index in `move_index` for later pi construction."""
+    handles, indices = board.legal_moves()
+    if len(indices) > 0:
+        leg = policy_logits[indices]
+        leg = leg - leg.max()
+        exp = np.exp(leg)
+        total = exp.sum()
+        priors = exp / total if total > 0 else exp
+        for h, idx, p in zip(handles, indices, priors):
+            child = Node(prior=float(p))
+            child.move_index = int(idx)
+            node.children[h] = child
     node.expanded = True
 
 
@@ -122,7 +110,7 @@ def run_simulations(games, evaluator, n_sims, add_root_noise=False):
     # Ensure root is expanded for each game (single pass, batched).
     needs_expand = [g for g in games if g.root is not None and not g.root.expanded]
     if needs_expand:
-        positions = np.stack([encode_position(g.board) for g in needs_expand])
+        positions = np.stack([g.board.encode() for g in needs_expand])
         logits, _ = evaluator.evaluate(positions)
         for g, logit in zip(needs_expand, logits):
             _expand_node(g.root, g.board, logit)
@@ -140,15 +128,15 @@ def run_simulations(games, evaluator, n_sims, add_root_noise=False):
         for g in games:
             if g.done:
                 continue
-            board = g.board.copy(stack=False)
+            board = g.board.clone_search()
             path = _walk_to_leaf(g.root, board)
-            tval = _terminal_value_for_side_to_move(board)
+            tval = board.terminal_value()
             leaves.append((g, path, board, tval))
 
         # Batch-evaluate non-terminal leaves.
         eval_slots = [(i, lf) for i, lf in enumerate(leaves) if lf[3] is None]
         if eval_slots:
-            positions = np.stack([encode_position(lf[2]) for _, lf in eval_slots])
+            positions = np.stack([lf[2].encode() for _, lf in eval_slots])
             logits, values = evaluator.evaluate(positions)
         else:
             logits, values = None, None
@@ -171,9 +159,9 @@ def visits_to_pi(root, board, temperature=1.0):
         return pi
     counts = []
     indices = []
-    for move, child in root.children.items():
+    for child in root.children.values():
         counts.append(child.visit_count)
-        indices.append(move_to_index(move, board))
+        indices.append(child.move_index)
     counts = np.array(counts, dtype=np.float64)
     if temperature == 0:
         # Deterministic argmax

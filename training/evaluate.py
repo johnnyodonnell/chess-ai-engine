@@ -22,10 +22,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import chess
 import numpy as np
 import torch
 
+from chess_backend import make_board
 from evaluator import LocalEvaluator
 from export import export
 from mcts import Node, run_simulations, sample_move
@@ -45,8 +45,8 @@ class RandomPlayer:
     def select_moves(self, boards, plies, opening_plies, rng):
         out = []
         for b in boards:
-            moves = list(b.legal_moves)
-            out.append(moves[int(rng.integers(len(moves)))])
+            handles, _ = b.legal_moves()
+            out.append(handles[int(rng.integers(len(handles)))])
         return out
 
 
@@ -80,14 +80,6 @@ class NetPlayer:
 # ---------------------------------------------------------------------------
 # Match play
 # ---------------------------------------------------------------------------
-def _result_white(board, ply):
-    """+1 white win, -1 black win, 0 draw (incl. max-plies cutoff)."""
-    outcome = board.outcome(claim_draw=True)
-    if outcome is None or outcome.winner is None:
-        return 0
-    return 1 if outcome.winner == chess.WHITE else -1
-
-
 def play_match(player_a, player_b, n_games, opening_plies, rng):
     """Play `n_games` between two players, alternating colors. The first
     `opening_plies` are sampled with temperature for diversity (otherwise
@@ -97,7 +89,7 @@ def play_match(player_a, player_b, n_games, opening_plies, rng):
     Returns (wins, draws, losses) from player_a's perspective.
     """
     games = [
-        SimpleNamespace(board=chess.Board(), a_is_white=(i % 2 == 0),
+        SimpleNamespace(board=make_board(), a_is_white=(i % 2 == 0),
                         done=False, ply=0, rw=0)
         for i in range(n_games)
     ]
@@ -107,7 +99,7 @@ def play_match(player_a, player_b, n_games, opening_plies, rng):
         for g in games:
             if g.done:
                 continue
-            if (g.board.turn == chess.WHITE) == g.a_is_white:
+            if g.board.turn == g.a_is_white:
                 a_turn.append(g)
             else:
                 b_turn.append(g)
@@ -121,8 +113,9 @@ def play_match(player_a, player_b, n_games, opening_plies, rng):
             for g, mv in zip(group, moves):
                 g.board.push(mv)
                 g.ply += 1
-                if g.board.is_game_over(claim_draw=True) or g.ply >= MAX_PLIES:
-                    g.rw = _result_white(g.board, g.ply)
+                res = g.board.outcome_white()
+                if res is not None or g.ply >= MAX_PLIES:
+                    g.rw = res if res is not None else 0
                     g.done = True
 
     wins = draws = losses = 0

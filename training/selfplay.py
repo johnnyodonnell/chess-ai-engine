@@ -3,10 +3,9 @@ batched leaf evaluations. Emits training tuples (state, policy_pi, z)
 into a replay buffer. Pure CPU/numpy (no torch import) so it can run in
 torch-free self-play workers driving a RemoteEvaluator."""
 
-import chess
 import numpy as np
 
-from encode import POLICY_SIZE, encode_position
+from chess_backend import make_board
 from mcts import Node, run_simulations, sample_move, visits_to_pi
 
 
@@ -24,7 +23,7 @@ MAX_PLIES = 256
 
 class GameRunner:
     def __init__(self):
-        self.board = chess.Board()
+        self.board = make_board()
         self.root = Node()
         self.history = []  # list of (state_tensor, pi_target, side_to_move)
         self.done = False
@@ -43,7 +42,8 @@ def _finalize(game):
     out = []
     z_white = game.result
     for state, pi, side_to_move in game.history:
-        z = z_white if side_to_move == chess.WHITE else -z_white
+        # side_to_move is the board's `turn` flag (True == white).
+        z = z_white if side_to_move else -z_white
         out.append((state, pi, z))
     return out
 
@@ -64,7 +64,7 @@ def play_batch(evaluator, n_games, n_sims, rng=None):
 
         for g in active:
             pi = visits_to_pi(g.root, g.board, temperature=g.temperature())
-            state = encode_position(g.board)
+            state = g.board.encode()
             g.history.append((state, pi, g.board.turn))
             move = sample_move(g.root, g.board, temperature=g.temperature(), rng=rng)
             g.board.push(move)
@@ -75,16 +75,9 @@ def play_batch(evaluator, n_games, n_sims, rng=None):
             else:
                 g.root = Node()
 
-            if g.board.is_game_over(claim_draw=True) or len(g.history) >= MAX_PLIES:
-                outcome = g.board.outcome(claim_draw=True)
-                if outcome is None:
-                    g.result = 0  # max-plies cutoff = draw
-                elif outcome.winner is None:
-                    g.result = 0
-                elif outcome.winner == chess.WHITE:
-                    g.result = 1
-                else:
-                    g.result = -1
+            res = g.board.outcome_white()
+            if res is not None or len(g.history) >= MAX_PLIES:
+                g.result = res if res is not None else 0  # max-plies cutoff = draw
                 g.done = True
                 results.extend(_finalize(g))
                 n_completed += 1

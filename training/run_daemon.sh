@@ -7,6 +7,11 @@
 # latest.pt (checkpoint format is shared with the legacy loop.py).
 # Rollback: swap `orchestrator.py ...` back to `loop.py --snapshot-every 4h
 # --save-latest-every 300s --out-dir "$OUT_DIR"` and restart.
+#
+# Self-play board backend: native Rust (chess_rs, ~2.5x faster game gen) by
+# default. Instant rollback to the python-chess reference: start the daemon
+# with CHESS_BACKEND=python (e.g. `CHESS_BACKEND=python pm2 restart chess-train
+# --update-env`).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,6 +24,8 @@ INIT_ARGS=()
 if [[ -n "${INIT_FROM:-}" ]]; then
   INIT_ARGS=(--init-from "$INIT_FROM")
 fi
+
+export CHESS_BACKEND="${CHESS_BACKEND:-rust}"
 
 cd "$REPO_DIR/training"
 exec "$VENV/bin/python" orchestrator.py \
