@@ -286,16 +286,21 @@ def evaluate(run_dir, candidate, games_per_pair, sims, opening_plies,
         sorted(names, key=lambda m: ratings.get(m, 0.0), reverse=True)
     ), flush=True)
 
-    served, served_rating = pool.get("served"), pool.get("served_rating")
+    served = pool.get("served")
+    # Compare against the served model's CURRENT refit rating, not the frozen
+    # served_rating: every refit drifts the whole scale, so a stale threshold
+    # becomes unbeatable and best.onnx would stick forever. served_rating is
+    # kept as an informational stamp of the rating at promotion time.
+    served_now = ratings.get(served) if served else None
     sane = (cand_vs_random is None) or (cand_vs_random >= 0.6)
     if leader and sane:
         lead_r = ratings[leader]
-        if served is None or lead_r > (served_rating or -1e9) + serve_margin:
+        if served is None or lead_r > (served_now or -1e9) + serve_margin:
             _serve(run_dir, pool, leader)
             pool["served"], pool["served_rating"] = leader, round(lead_r, 1)
             print(f"[eval] SERVED {leader} (rating={lead_r:.1f})", flush=True)
         else:
-            print(f"[eval] kept {served} (rating={served_rating}); "
+            print(f"[eval] kept {served} (rating={served_now:.1f}); "
                   f"leader {leader}={lead_r:.1f} within margin", flush=True)
     elif not sane:
         print(f"[eval] candidate failed random sanity gate "
