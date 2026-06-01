@@ -38,7 +38,7 @@ def drive_rust(seed):
     ev = DetEval()
     eng = chess_rs.MctsEngine(N_GAMES, SIMS, seed, True)
     rows = []
-    eng.run(ev.evaluate, rows.extend, lambda: False, False)
+    eng.run(ev.evaluate, lambda rs, n: rows.extend(rs), lambda: False, False)
     return rows
 
 
@@ -65,7 +65,7 @@ def test_refill_runs_and_emits():
     ev = DetEval()
     eng = chess_rs.MctsEngine(N_GAMES, SIMS, SEED, True)
     rows = []
-    eng.run(ev.evaluate, rows.extend, lambda: len(rows) > one_pass, True)
+    eng.run(ev.evaluate, lambda rs, n: rows.extend(rs), lambda: len(rows) > one_pass, True)
     assert len(rows) > one_pass, f"refill produced only {len(rows)} <= {one_pass}"
     return len(rows)
 

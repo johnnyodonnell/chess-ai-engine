@@ -558,10 +558,11 @@ impl MctsEngine {
     ///
     /// `forward(batch)` is a Python callable taking an (M,18,8,8) f32 ndarray
     /// and returning (logits[M,4672] f32, values[M] f32). It is the ONLY
-    /// crossing back into Python — the in-process GPU forward. `result_sink(rows)`
-    /// receives a list of finished (state(18,8,8), pi(4672,), z) tuples after
-    /// each move cycle (push them onto the trainer queue). `stop()` returns True
-    /// to end the loop (orphan/parent-death + shutdown checks live there).
+    /// crossing back into Python — the in-process GPU forward.
+    /// `result_sink(rows, n_finished)` receives a list of finished
+    /// (state(18,8,8), pi(4672,), z) tuples plus the number of games that
+    /// finished this cycle (push them onto the trainer queue). `stop()` returns
+    /// True to end the loop (orphan/parent-death + shutdown checks live there).
     ///
     /// refill=True: run until `stop`, refilling finished games so the batch stays
     /// full. refill=False: stop when every game is done (the equivalence test).
@@ -590,10 +591,13 @@ impl MctsEngine {
             }
             self.step_moves();
 
+            // Every game is refilled each cycle, so any game still `done` here
+            // finished THIS cycle — that's the finished-game count for stats.
             if !self.results.is_empty() {
+                let n_finished = self.games.iter().filter(|g| g.done).count();
                 let rows = self.take_results(py);
                 let list = PyList::new(py, rows)?;
-                result_sink.call1(py, (list,))?;
+                result_sink.call1(py, (list, n_finished))?;
             }
 
             if refill {

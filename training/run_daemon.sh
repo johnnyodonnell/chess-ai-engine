@@ -40,7 +40,13 @@ export CHESS_BACKEND="${CHESS_BACKEND:-rust_mcts}"
 # -> 27k; gpw=16 + spin (12 workers) -> 67k pos/s (and small gpw = good replay
 # diversity, no warmup). So rust_mcts uses small gpw + spin-wait; the slower
 # paths (python / rust board) pipeline via their own CPU jitter and don't spin.
-if [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
+if [[ "$CHESS_BACKEND" == "rust_inproc" ]]; then
+  # Option B: a single self-play process runs MctsEngine.run entirely in Rust
+  # and does the forward IN-PROCESS (no inference server, no shm, no spin-wait).
+  # games-in-flight (the NN batch width) = WORKERS * GAMES_PER_WORKER.
+  DEFAULT_GPW=16
+  DEFAULT_WORKERS=12
+elif [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
   DEFAULT_GPW=16
   DEFAULT_WORKERS=12
   # Hybrid spin-wait: worker busy-checks the response for INFER_SPIN_US us before
