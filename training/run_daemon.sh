@@ -8,11 +8,13 @@
 # Rollback: swap `orchestrator.py ...` back to `loop.py --snapshot-every 4h
 # --save-latest-every 300s --out-dir "$OUT_DIR"` and restart.
 #
-# Self-play backend: native Rust MCTS engine (chess_rs, CHESS_BACKEND=rust_mcts)
-# by default — bit-exact with the Python MCTS (test_mcts_parity.py) but runs the
-# whole search in Rust. Instant rollback: start with CHESS_BACKEND=rust (Rust
-# board + Python MCTS) or CHESS_BACKEND=python (python-chess reference), e.g.
-# `CHESS_BACKEND=rust pm2 restart chess-train --update-env`.
+# Self-play backend: in-process native engine (chess_rs, CHESS_BACKEND=rust_inproc)
+# by default — one self-play process runs the whole MctsEngine.run loop in Rust
+# and does the GPU forward IN-PROCESS (no inference server, no shm channels, no
+# spin-wait). Bit-identical games to rust_mcts (test_rust_inproc.py); A/B showed
+# throughput parity at ~1/10 the CPU (no spin). Instant rollback to the previous
+# path: `CHESS_BACKEND=rust_mcts pm2 restart chess-train --update-env` (server +
+# workers + spin-wait), or rust / python for the reference paths.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +28,7 @@ if [[ -n "${INIT_FROM:-}" ]]; then
   INIT_ARGS=(--init-from "$INIT_FROM")
 fi
 
-export CHESS_BACKEND="${CHESS_BACKEND:-rust_mcts}"
+export CHESS_BACKEND="${CHESS_BACKEND:-rust_inproc}"
 
 # Self-play concurrency + IPC. rust_mcts makes a worker's per-sim CPU work
 # negligible, so workers fall into a lockstep "convoy" on the central GPU
