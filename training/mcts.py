@@ -56,8 +56,10 @@ def _expand_node(node, board, policy_logits):
     its AlphaZero policy index in `move_index` for later pi construction."""
     handles, indices = board.legal_moves()
     if len(indices) > 0:
-        leg = policy_logits[indices]
-        leg = leg - leg.max()
+        # f64 softmax: numpy-f64 exp is bit-identical to libm (= Rust f64::exp),
+        # so this matches the Rust MCTS engine exactly for parity testing.
+        leg = policy_logits[indices].astype(np.float64)
+        leg -= leg.max()
         exp = np.exp(leg)
         total = exp.sum()
         priors = exp / total if total > 0 else exp

@@ -87,7 +87,12 @@ class PyBoard:
         return 0.0 if oc.winner is None else -1.0
 
 
-if BACKEND == "rust":
+# rust_mcts: the self-play worker drives the native MctsEngine (see
+# selfplay.play_batch_rust); evaluation keeps using the Python MCTS on the same
+# native Board, so it shares the `rust` board path here.
+USE_RUST_ENGINE = BACKEND == "rust_mcts"
+
+if BACKEND in ("rust", "rust_mcts"):
     import chess_rs
 
     _Board = chess_rs.Board

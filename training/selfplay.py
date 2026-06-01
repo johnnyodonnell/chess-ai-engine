@@ -5,7 +5,7 @@ torch-free self-play workers driving a RemoteEvaluator."""
 
 import numpy as np
 
-from chess_backend import make_board
+from chess_backend import USE_RUST_ENGINE, make_board
 from mcts import Node, run_simulations, sample_move, visits_to_pi
 
 
@@ -86,6 +86,29 @@ def play_batch(evaluator, n_games, n_sims, rng=None):
     return results, {"games": n_completed, "avg_plies": total_plies / max(1, n_completed)}
 
 
+def play_batch_rust(evaluator, n_games, sims, rng):
+    """Self-play via the native Rust MctsEngine (CHESS_BACKEND=rust_mcts).
+
+    The engine owns the boards + trees + per-game history; Python only does the
+    batched GPU handoff through `evaluator`. A fresh per-batch engine seed
+    (drawn from the worker rng) keeps games diverse across batches. Emits the
+    same (state, pi, z) tuples as play_batch."""
+    import chess_rs
+
+    engine_seed = int(rng.integers(0, 2**63 - 1))
+    engine = chess_rs.MctsEngine(n_games, sims, engine_seed, True)
+    while not engine.all_done():
+        while True:
+            batch = engine.pending_positions()
+            if batch is None:
+                break
+            logits, values = evaluator.evaluate(batch)
+            engine.apply_evals(logits, values)
+        engine.step_moves()
+    results = engine.take_results()
+    return results, {"games": n_games, "avg_plies": len(results) / max(1, n_games)}
+
+
 def run_worker(channel, out_queue, stop_event, seed, games_per_worker, sims):
     """Self-play worker process entrypoint (torch-free, CPU-only).
 
@@ -104,7 +127,10 @@ def run_worker(channel, out_queue, stop_event, seed, games_per_worker, sims):
     evaluator = RemoteEvaluator(channel)
     # Exit if orphaned (parent hard-killed without setting stop_event).
     while not stop_event.is_set() and os.getppid() != 1:
-        results, stats = play_batch(evaluator, games_per_worker, sims, rng=rng)
+        if USE_RUST_ENGINE:
+            results, stats = play_batch_rust(evaluator, games_per_worker, sims, rng)
+        else:
+            results, stats = play_batch(evaluator, games_per_worker, sims, rng=rng)
         item = (results, stats["games"], stats["avg_plies"])
         while not stop_event.is_set():
             try:
