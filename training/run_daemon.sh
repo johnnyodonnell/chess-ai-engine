@@ -28,20 +28,32 @@ fi
 
 export CHESS_BACKEND="${CHESS_BACKEND:-rust_mcts}"
 
-# Self-play concurrency. rust_mcts makes a worker's per-sim CPU work negligible,
-# so all workers fall into a lockstep "convoy" on the central GPU inference
-# server: it runs one big batched forward, then sits idle (~80-90%) waiting for
-# the whole convoy to wake (mp.Event latency) and resubmit together. Each cycle
-# is gated by that fixed round-trip latency, not the GPU — so the cure is to
-# pack far more positions into every forward by raising games-per-worker.
-# Measured on run1's net (20 workers, 200 sims): gpw=16 -> ~22k pos/s (HALF the
-# Python-MCTS rate — the regression), gpw=96 -> ~49k pos/s (beats it, GPU still
-# ~90% idle). The slower paths (python / rust board) pipeline naturally via
-# their own CPU jitter and gain nothing from a big gpw, so keep their tuned 16.
+# Self-play concurrency + IPC. rust_mcts makes a worker's per-sim CPU work
+# negligible, so workers fall into a lockstep "convoy" on the central GPU
+# inference server: it runs a batched forward, then idles waiting for the whole
+# convoy to wake (mp.Event futex -> scheduler wakeup) and resubmit together. Two
+# ways to fight the resulting GPU starvation:
+#   1. Huge games-per-worker (gpw=96) to amortize the idle — works (~49k pos/s)
+#      but couples gpw to GPU efficiency, hurting replay diversity / burstiness.
+#   2. Spin-wait the round trip so a SMALL gpw saturates the GPU (below).
+# Measured on run1's net (200 sims): gpw=96 no-spin -> 49k pos/s; gpw=16 no-spin
+# -> 27k; gpw=16 + spin (12 workers) -> 67k pos/s (and small gpw = good replay
+# diversity, no warmup). So rust_mcts uses small gpw + spin-wait; the slower
+# paths (python / rust board) pipeline via their own CPU jitter and don't spin.
 if [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
-  DEFAULT_GPW=96
+  DEFAULT_GPW=16
+  DEFAULT_WORKERS=12
+  # Hybrid spin-wait: worker busy-checks the response for INFER_SPIN_US us before
+  # blocking; server busy-polls (INFER_IDLE_SLEEP=0) so a returning convoy is
+  # noticed immediately. Costs CPU (workers spin through the ~2ms forward) but
+  # the cores would otherwise sit idle on a dedicated box. Disable by exporting
+  # INFER_SPIN_US=0. The spin budget must exceed the forward time to catch the
+  # response without sleeping; ~3ms suits run1's net at these batch sizes.
+  export INFER_SPIN_US="${INFER_SPIN_US:-3000}"
+  export INFER_IDLE_SLEEP="${INFER_IDLE_SLEEP:-0}"
 else
   DEFAULT_GPW=16
+  DEFAULT_WORKERS=20
 fi
 
 cd "$REPO_DIR/training"
@@ -49,7 +61,7 @@ exec "$VENV/bin/python" orchestrator.py \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --save-latest-every 300s \
   --out-dir "$OUT_DIR" \
-  --workers "${WORKERS:-20}" \
+  --workers "${WORKERS:-$DEFAULT_WORKERS}" \
   --games-per-worker "${GAMES_PER_WORKER:-$DEFAULT_GPW}" \
   --sims "${SIMS:-200}" \
   "${INIT_ARGS[@]}"
