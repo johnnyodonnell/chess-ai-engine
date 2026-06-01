@@ -149,6 +149,15 @@ class RemoteEvaluator(Evaluator):
         self.ch = channel
         self.timeout = timeout
         self.ch.attach()
+        # Hybrid spin-wait (INFER_SPIN_US microseconds, 0 = off): before falling
+        # back to a blocking Event.wait, busy-check the response for a bounded
+        # window to dodge the futex sleep/wakeup latency that dominates the round
+        # trip when workers are fast and synchronize into a "convoy" on the GPU
+        # server (rust_mcts). is_set() takes the Event's internal lock, which
+        # also serves as the acquire barrier for the server's result writes, so
+        # this stays correct on weakly-ordered (aarch64) hardware — unlike a raw
+        # shared-memory flag, which would need an explicit fence.
+        self._spin_secs = float(os.environ.get("INFER_SPIN_US", "0")) / 1e6
 
     def evaluate(self, positions):
         n = positions.shape[0]
@@ -159,6 +168,11 @@ class RemoteEvaluator(Evaluator):
         self.ch.count.value = n
         self.ch.resp_ready.clear()
         self.ch.req_ready.set()
+        if self._spin_secs > 0.0:
+            spin_end = time.perf_counter() + self._spin_secs
+            while time.perf_counter() < spin_end:
+                if self.ch.resp_ready.is_set():
+                    return self.ch.logits[:n].copy(), self.ch.vals[:n].copy()
         # Wait in short slices so an orphaned worker (dead parent/server) exits
         # promptly instead of blocking for the full timeout.
         deadline = time.time() + self.timeout

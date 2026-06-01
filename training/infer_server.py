@@ -42,6 +42,12 @@ def run_server(channels, weights_path, stop_event, device_str="cuda",
     use_cuda = device_str == "cuda" and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
+    # When the workers spin-wait (INFER_SPIN_US), match them on this side: drop
+    # the idle poll toward a busy-spin (INFER_IDLE_SLEEP=0 -> sched_yield) so the
+    # server notices a returning convoy immediately instead of up to idle_sleep
+    # late. Costs one hot core; default keeps the original 0.2ms poll.
+    idle_sleep = float(os.environ.get("INFER_IDLE_SLEEP", idle_sleep))
+
     for ch in channels:
         ch.attach()
 
