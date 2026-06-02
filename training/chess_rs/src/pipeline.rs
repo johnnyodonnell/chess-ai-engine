@@ -19,15 +19,21 @@
 //!     handed to the consumer and workers fill the other. Flush-on-SIZE only. If
 //!     BOTH buckets are full all workers BLOCK (accepted backpressure). In-flight
 //!     game count self-regulates to ~2*bucket_size.
-//!   - ONE CONSUMER thread (the only thread that touches Python besides the rare
-//!     worker `submit_game`): takes a full bucket, runs the Python `forward` under
-//!     the GIL, attaches each result row to its game, and RE-QUEUES the game. The
-//!     consumer does NO tree work.
+//!   - ONE CONSUMER thread: takes a full bucket, runs the Python `forward` under
+//!     the GIL back-to-back, and hands the RAW result (numpy, uncopied) to the
+//!     scatter thread — it does NO copy, NO re-queue, NO tree work, so forwards run
+//!     with no GPU-idle gap between them.
+//!   - ONE SCATTER thread: copies the forward output out of numpy ONCE into a
+//!     shared `Arc<Vec<f32>>` (under the GIL), then re-queues each game with an
+//!     `Arc::clone` + its batch row (queue lock held only for the cheap clones).
+//!     This copy overlaps the consumer's NEXT forward (PyTorch frees the GIL during
+//!     CUDA compute). Workers slice their own row lazily in `apply_result`.
 //!
 //! One outstanding NN leaf per game at all times (no virtual loss): a game is
-//! EITHER on the queue (no eval) OR in a bucket / being forwarded (exactly one
-//! eval) — never both. Determinism is NOT a goal (dynamic spawning makes the set
-//! of games race-dependent); the routing-integrity test guards correctness.
+//! EITHER on the queue (no eval) OR in a bucket / being forwarded / being scattered
+//! (exactly one eval) — never both. Determinism is NOT a goal (dynamic spawning
+//! makes the set of games race-dependent); the routing-integrity test guards
+//! correctness.
 //!
 //! The result rows for a finished game are handed to the Python `submit_game(rows)`
 //! callback (brief GIL acquisition; game-rate, so rare). All MCTS math is reused
@@ -47,6 +53,7 @@ use rand::SeedableRng;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -81,7 +88,11 @@ struct LeafCtx {
 }
 
 struct EvalResult {
-    logits: Vec<f32>, // POLICY_SIZE
+    // The FULL batch policy [m * POLICY_SIZE], shared by all games in the batch.
+    // The worker slices its own `row` lazily in `apply_result` (GIL-free) — no
+    // per-game copy on the consumer's GPU-launch path.
+    logits: Arc<Vec<f32>>,
+    row: usize, // this game's row in the batch
     value: f32,
 }
 
@@ -91,7 +102,7 @@ struct InFlight {
     game: Game,
     rng: StdRng,
     phase: GamePhase,
-    pending: Option<EvalResult>, // written by the consumer, consumed by the worker
+    pending: Option<EvalResult>, // written by the scatter thread, consumed by the worker
     leaf_ctx: Option<LeafCtx>,   // Some exactly while an eval is outstanding
     staged_enc: Vec<f32>,        // encoded leaf board, copied into the bucket on push
 }
@@ -228,9 +239,11 @@ fn step_move(g: &mut InFlight) {
 /// consumer), then advance the FSM cursor.
 fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
     let ctx = g.leaf_ctx.take().expect("pending result without leaf_ctx");
+    // Lazy slice into the shared batch buffer — this game's row only.
+    let logits = &res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE];
     match ctx.kind {
         LeafKind::RootExpand => {
-            expand_node(&mut g.game.arena, 0, &ctx.board, &res.logits);
+            expand_node(&mut g.game.arena, 0, &ctx.board, logits);
             if config.add_root_noise {
                 add_dirichlet_noise(&mut g.game.arena, 0, &mut g.rng);
             }
@@ -238,7 +251,7 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
         }
         LeafKind::SimLeaf => {
             let leaf = *ctx.path.last().unwrap();
-            expand_node(&mut g.game.arena, leaf, &ctx.board, &res.logits);
+            expand_node(&mut g.game.arena, leaf, &ctx.board, logits);
             backprop(&mut g.game.arena, &ctx.path, res.value as f64);
             if let GamePhase::Simulating(s) = g.phase {
                 g.phase = GamePhase::Simulating(s + 1);
@@ -395,10 +408,64 @@ fn worker_loop(shared: Arc<Shared>, submit_game: PyObject) {
     }
 }
 
+/// Handoff from the consumer to the scatter thread: the raw Python `forward`
+/// result (logits[m,POLICY] + values[m] numpy, held as a Py object — `Send`,
+/// needs the GIL only to read) and the m games it belongs to, positionally.
+type ScatterMsg = (PyObject, Vec<Box<InFlight>>);
+
+/// Scatter thread: OFF the consumer's GPU-launch path. Copy the forward output
+/// out of numpy ONCE into an `Arc<Vec<f32>>` (under the GIL — numpy can't outlive
+/// it), then DROP the GIL and re-queue each game with a cheap `Arc::clone` + its
+/// row index. The queue lock is held only for the clones+pushes (microseconds),
+/// not the ~1.3 ms of memcpy it used to be — so workers no longer stall on it and
+/// the consumer's next forward overlaps this copy (PyTorch frees the GIL during
+/// CUDA compute). Workers slice their own row lazily in `apply_result`.
+fn scatter_loop(shared: Arc<Shared>, rx: Receiver<ScatterMsg>) {
+    // Exits when the consumer drops the sender (recv -> Err) — i.e. on shutdown.
+    while let Ok((result, games)) = rx.recv() {
+        let extracted = Python::with_gil(|py| -> PyResult<(Vec<f32>, Vec<f32>)> {
+            let bound = result.bind(py);
+            let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
+                bound.extract()?;
+            Ok((logits.as_slice()?.to_vec(), values.as_slice()?.to_vec()))
+        });
+        let (logits_flat, values_flat) = match extracted {
+            Ok(v) => v,
+            Err(e) => {
+                // `forward` returned an unexpected shape/type. Fail the run rather
+                // than silently mis-route corrupted targets into training.
+                Python::with_gil(|py| e.print(py));
+                shared.stop.store(true, AtomicOrdering::Relaxed);
+                shared.bucket_cv_worker.notify_all();
+                shared.bucket_cv_consumer.notify_all();
+                return;
+            }
+        };
+        let logits = Arc::new(logits_flat);
+        let mut q = shared.queue.lock().unwrap();
+        for (r, mut g) in games.into_iter().enumerate() {
+            g.pending = Some(EvalResult {
+                logits: Arc::clone(&logits),
+                row: r,
+                value: values_flat[r],
+            });
+            let key = g.game.history.len() as u64;
+            let seq = g.id;
+            q.push(Queued { key, seq, item: g });
+        }
+    }
+}
+
 /// Consumer: the only thread running the GPU forward. Take a full bucket, run
-/// `forward`, attach results, re-queue. Polls `stop` (with a bounded wait so it
-/// still polls when no bucket ever fills — flush-on-size-only is preserved).
-fn consumer_loop(shared: Arc<Shared>, forward: PyObject, stop: PyObject) -> PyResult<()> {
+/// `forward` back-to-back, and hand the raw result to the scatter thread (which
+/// copies it out + re-queues). Polls `stop` (with a bounded wait so it still polls
+/// when no bucket ever fills — flush-on-size-only is preserved).
+fn consumer_loop(
+    shared: Arc<Shared>,
+    forward: PyObject,
+    stop: PyObject,
+    scatter_tx: SyncSender<ScatterMsg>,
+) -> PyResult<()> {
     loop {
         // (A) acquire a full bucket, polling stop() while idle.
         let bucket = loop {
@@ -425,33 +492,23 @@ fn consumer_loop(shared: Arc<Shared>, forward: PyObject, stop: PyObject) -> PyRe
             }
         };
 
-        // (B) GPU forward under the GIL.
+        // (B) GPU forward under the GIL. Keep the raw numpy result — do NOT copy
+        // it out here; that copy belongs off this thread (the scatter thread).
         let Bucket { enc, games } = bucket;
         let m = games.len();
-        let (logits_flat, values_flat) =
-            Python::with_gil(|py| -> PyResult<(Vec<f32>, Vec<f32>)> {
-                let arr = Array4::from_shape_vec((m, 18, 8, 8), enc)
-                    .unwrap()
-                    .into_pyarray(py);
-                let out = forward.call1(py, (arr,))?;
-                let bound = out.bind(py);
-                let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
-                    bound.extract()?;
-                Ok((logits.as_slice()?.to_vec(), values.as_slice()?.to_vec()))
-            })?;
+        let result: PyObject = Python::with_gil(|py| -> PyResult<PyObject> {
+            let arr = Array4::from_shape_vec((m, 18, 8, 8), enc)
+                .unwrap()
+                .into_pyarray(py);
+            forward.call1(py, (arr,))
+        })?;
 
-        // (C) scatter results into each game (positional) and re-queue.
-        {
-            let mut q = shared.queue.lock().unwrap();
-            for (r, mut g) in games.into_iter().enumerate() {
-                g.pending = Some(EvalResult {
-                    logits: logits_flat[r * POLICY_SIZE..(r + 1) * POLICY_SIZE].to_vec(),
-                    value: values_flat[r],
-                });
-                let key = g.game.history.len() as u64;
-                let seq = g.id;
-                q.push(Queued { key, seq, item: g });
-            }
+        // (C) hand the result + its games to the scatter thread and loop straight
+        // back into the next forward. Bounded channel -> backpressure if scatter
+        // falls behind. A send error means scatter has exited (shutdown).
+        if scatter_tx.send((result, games)).is_err() {
+            shared.stop.store(true, AtomicOrdering::Relaxed);
+            return Ok(());
         }
 
         // (D) poll stop after the forward.
@@ -536,12 +593,22 @@ impl PipelineEngine {
         // GIL released for the threaded section; consumer/workers reacquire it per
         // forward / submit_game / stop via Python::with_gil.
         py.allow_threads(move || -> PyResult<()> {
+            // Consumer -> scatter handoff. Depth 2 lets the consumer run a forward
+            // (or two) ahead of the scatter copy; combined with the two-bucket
+            // staging this is the pipeline's double-buffering.
+            let (scatter_tx, scatter_rx) = sync_channel::<ScatterMsg>(2);
             let mut handles = Vec::with_capacity(n_threads);
             for sg in submit_games {
                 let sh = shared.clone();
                 handles.push(thread::spawn(move || worker_loop(sh, sg)));
             }
-            let res = consumer_loop(shared.clone(), forward, stop);
+            let scatter_handle = {
+                let sh = shared.clone();
+                thread::spawn(move || scatter_loop(sh, scatter_rx))
+            };
+            // consumer_loop owns scatter_tx; when it returns the sender drops, so
+            // the scatter thread sees recv() -> Err and exits.
+            let res = consumer_loop(shared.clone(), forward, stop, scatter_tx);
             // Ensure workers exit even on a Python error / early return.
             shared.stop.store(true, AtomicOrdering::Relaxed);
             shared.bucket_cv_worker.notify_all();
@@ -549,6 +616,7 @@ impl PipelineEngine {
             for h in handles {
                 let _ = h.join();
             }
+            let _ = scatter_handle.join();
             res
         })
     }
