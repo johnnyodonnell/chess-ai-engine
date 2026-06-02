@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Board from './components/Board.jsx'
 import Status from './components/Status.jsx'
 import { bestMove, preload } from './engine/alphazero/index.js'
@@ -7,12 +7,14 @@ import {
   applyMove,
   createGame,
   getStatus,
+  getTurn,
   isGameOver,
+  tryMove,
 } from './engine/game.js'
 
-function statusMessage(fen, thinking) {
+function statusMessage(game, thinking) {
   if (thinking) return 'Bot thinking…'
-  const status = getStatus(fen)
+  const status = getStatus(game)
   if (status.kind === 'checkmate') {
     return status.winner === HUMAN ? 'Checkmate — you win' : 'Checkmate — bot wins'
   }
@@ -21,16 +23,12 @@ function statusMessage(fen, thinking) {
   return 'Your turn'
 }
 
-// Try the move as given; if it fails, retry as a queen promotion (covers
-// pawn-reaches-back-rank without a picker — v1 auto-promotes to queen).
-function tryMove(fen, from, to) {
-  const direct = applyMove(fen, { from, to })
-  if (direct !== null) return direct
-  return applyMove(fen, { from, to, promotion: 'q' })
-}
-
 export default function App() {
-  const [fen, setFen] = useState(createGame)
+  // The Chess instance is the source of truth — held in a ref so its move
+  // history (and thus repetition/fifty-move detection) survives across renders.
+  // `fen` exists only to drive rendering; we bump it after each mutation.
+  const gameRef = useRef(createGame())
+  const [fen, setFen] = useState(() => gameRef.current.fen())
   const [thinking, setThinking] = useState(false)
 
   // Warm up the ONNX session as soon as the page loads — saves a noticeable
@@ -40,18 +38,21 @@ export default function App() {
   }, [])
 
   async function handleDrop({ from, to }) {
-    if (isGameOver(fen) || thinking) return false
+    const game = gameRef.current
+    if (isGameOver(game) || thinking) return false
 
-    const afterHuman = tryMove(fen, from, to)
-    if (afterHuman === null) return false
+    if (!tryMove(game, from, to)) return false
 
-    setFen(afterHuman)
-    if (isGameOver(afterHuman)) return true
+    setFen(game.fen())
+    if (isGameOver(game)) return true
 
     setThinking(true)
     try {
-      const botMove = await bestMove(afterHuman)
-      if (botMove) setFen(applyMove(afterHuman, botMove))
+      const botMove = await bestMove(game.fen())
+      if (botMove) {
+        applyMove(game, botMove)
+        setFen(game.fen())
+      }
     } finally {
       setThinking(false)
     }
@@ -60,14 +61,18 @@ export default function App() {
 
   function newGame() {
     if (thinking) return
-    setFen(createGame())
+    gameRef.current = createGame()
+    setFen(gameRef.current.fen())
   }
+
+  const game = gameRef.current
+  const interactive = getTurn(game) === HUMAN && !isGameOver(game)
 
   return (
     <main className="app">
       <h1>Chess</h1>
-      <Status message={statusMessage(fen, thinking)} />
-      <Board fen={fen} onDrop={handleDrop} />
+      <Status message={statusMessage(game, thinking)} />
+      <Board fen={fen} interactive={interactive} onDrop={handleDrop} />
       <button className="new-game" onClick={newGame} disabled={thinking}>
         New Game
       </button>

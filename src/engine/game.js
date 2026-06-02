@@ -1,7 +1,7 @@
 // Pure chess rules — a thin wrapper over chess.js. No React, no side effects
-// on caller state. Positions are passed in and out as FEN strings, mirroring
-// the "plain data in, plain data out" pattern of tic-tac-toe-ai-engine's
-// engine/game.js.
+// beyond mutating the Chess instance the caller passes in. The instance is the
+// source of truth and accumulates move history, which is what makes draw rules
+// like threefold repetition work: a bare FEN loses that history.
 
 import { Chess } from 'chess.js'
 
@@ -9,35 +9,40 @@ export const HUMAN = 'w'
 export const BOT = 'b'
 
 export function createGame() {
-  return new Chess().fen()
+  return new Chess()
 }
 
-// Returns the new FEN after applying `move`, or null if the move is illegal.
-// `move` may be a SAN string (e.g. 'e4') or { from, to, promotion? }.
-export function applyMove(fen, move) {
-  const game = new Chess(fen)
+// Applies `move`, mutating `game`. Returns true if the move was legal (and
+// applied), false otherwise. `move` may be a SAN string or { from, to, promotion? }.
+export function applyMove(game, move) {
   try {
     game.move(move)
-    return game.fen()
+    return true
   } catch {
-    return null
+    return false
   }
 }
 
-export function getTurn(fen) {
-  return new Chess(fen).turn()
+// Tries a human drag as given; if it fails, retries as a queen promotion
+// (covers pawn-reaches-back-rank without a picker — v1 auto-promotes to queen).
+// Mutates `game`; returns true if a move was applied.
+export function tryMove(game, from, to) {
+  return applyMove(game, { from, to }) || applyMove(game, { from, to, promotion: 'q' })
 }
 
-export function isGameOver(fen) {
-  return new Chess(fen).isGameOver()
+export function getTurn(game) {
+  return game.turn()
+}
+
+export function isGameOver(game) {
+  return game.isGameOver()
 }
 
 // Classifies the position. `kind` is one of:
 //   'in-progress' | 'checkmate' | 'stalemate' | 'draw'
 // For checkmate, `winner` is the side that delivered mate.
 // For draws other than stalemate, `reason` says why.
-export function getStatus(fen) {
-  const game = new Chess(fen)
+export function getStatus(game) {
   if (game.isCheckmate()) {
     // The side to move is the one that got mated.
     const winner = game.turn() === HUMAN ? BOT : HUMAN

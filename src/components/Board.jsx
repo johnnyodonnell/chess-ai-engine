@@ -1,13 +1,11 @@
 import { Chessboard } from 'react-chessboard'
-import { HUMAN, getTurn, isGameOver } from '../engine/game.js'
 
-// Wraps react-chessboard v5. Orientation is fixed to white. Dragging is
-// allowed only when it's the human's turn and the game isn't over.
+// Wraps react-chessboard v5. Orientation is fixed to white. `fen` is the
+// position to render; `interactive` (computed by the caller from the live game)
+// controls whether dragging is allowed.
 // onDrop({ from, to }) -> boolean: returns true if the move was accepted
 // (react-chessboard keeps the piece on the target square), false to revert.
-export default function Board({ fen, onDrop }) {
-  const interactive = getTurn(fen) === HUMAN && !isGameOver(fen)
-
+export default function Board({ fen, interactive, onDrop }) {
   const options = {
     position: fen,
     boardOrientation: 'white',
