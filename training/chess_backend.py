@@ -98,7 +98,13 @@ USE_RUST_ENGINE = BACKEND == "rust_mcts"
 # native `rust` board path.
 USE_INPROC_ENGINE = BACKEND == "rust_inproc"
 
-if BACKEND in ("rust", "rust_mcts", "rust_inproc"):
+# rust_async: like rust_inproc but the native engine runs MANY MCTS worker
+# threads (GIL released) feeding ONE consumer that does big batched in-process
+# forwards — CPU/GPU overlap for higher games/sec. See selfplay.run_selfplay_async
+# and chess_rs::AsyncMctsEngine. Shares the native `rust` board path.
+USE_ASYNC_ENGINE = BACKEND == "rust_async"
+
+if BACKEND in ("rust", "rust_mcts", "rust_inproc", "rust_async"):
     import chess_rs
 
     _Board = chess_rs.Board

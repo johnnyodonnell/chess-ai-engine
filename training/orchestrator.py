@@ -28,9 +28,9 @@ from pathlib import Path
 
 import numpy as np
 
-from chess_backend import USE_INPROC_ENGINE
+from chess_backend import USE_ASYNC_ENGINE, USE_INPROC_ENGINE
 from evaluator import make_channels, unlink_blocks
-from selfplay import run_selfplay_inproc, run_worker
+from selfplay import run_selfplay_async, run_selfplay_inproc, run_worker
 
 
 def parse_duration(spec):
@@ -61,6 +61,15 @@ def parse_args():
     ap.add_argument("--games-per-worker", type=int, default=16)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--queue-max", type=int, default=64)
+    # rust_async knobs (CPU parallelism is decoupled from batch width)
+    ap.add_argument("--async-n-games", type=int, default=None,
+                    help="rust_async: total game slots in flight (NN batch-width "
+                         "ceiling). Defaults to workers*games-per-worker.")
+    ap.add_argument("--async-n-threads", type=int, default=None,
+                    help="rust_async: MCTS worker threads. Defaults to cpu_count-2.")
+    ap.add_argument("--async-max-batch", type=int, default=None,
+                    help="rust_async: max rows per GPU forward. Defaults to "
+                         "async-n-games.")
     # training
     ap.add_argument("--buffer-capacity", type=int, default=200_000)
     ap.add_argument("--min-buffer-for-train", type=int, default=2_000)
@@ -259,7 +268,31 @@ def main():
     out_queue = ctx.Queue(maxsize=args.queue_max)
     stop = ctx.Event()
 
-    if USE_INPROC_ENGINE:
+    if USE_ASYNC_ENGINE:
+        # rust_async: ONE self-play process runs the native multi-threaded engine
+        # (n_threads MCTS workers + 1 batching consumer doing in-process forwards)
+        # — no inference server, no shm. CPU parallelism (n_threads) is decoupled
+        # from batch width (n_games), so we can keep the GPU fed AND use all cores.
+        channels, blocks = [], []
+        n_games = args.async_n_games or (args.workers * args.games_per_worker)
+        n_threads = args.async_n_threads or max(1, (os.cpu_count() or 2) - 2)
+        max_batch = args.async_max_batch or n_games
+
+        def start_selfplay():
+            p = ctx.Process(
+                target=run_selfplay_async,
+                args=(out_queue, stop, args.seed + 1000, n_games, args.sims,
+                      str(serving_path), n_threads, max_batch, str(device)),
+            )
+            p.start()
+            return p
+
+        selfplay_proc = start_selfplay()
+        server_proc, workers = None, []
+        print(f"spawned 1 async self-play process (games={n_games} "
+              f"threads={n_threads} max_batch={max_batch} sims={args.sims}); "
+              f"no inference server", flush=True)
+    elif USE_INPROC_ENGINE:
         # Option B: ONE self-play process runs the whole MctsEngine.run loop and
         # does the forward in-process — no inference server, no shm channels, no
         # spin-wait. Total games-in-flight (the NN batch width) = workers * gpw,
@@ -337,9 +370,9 @@ def main():
     try:
         while True:
             # Supervise children — restart any that died.
-            if USE_INPROC_ENGINE:
+            if USE_INPROC_ENGINE or USE_ASYNC_ENGINE:
                 if not selfplay_proc.is_alive():
-                    print("warn: in-process self-play died; restarting", flush=True)
+                    print("warn: self-play process died; restarting", flush=True)
                     selfplay_proc = start_selfplay()
             else:
                 if not server_proc.is_alive():
@@ -436,7 +469,8 @@ def main():
     finally:
         print("shutting down: signaling workers + server", flush=True)
         stop.set()
-        procs = [selfplay_proc] if USE_INPROC_ENGINE else workers + [server_proc]
+        procs = ([selfplay_proc] if (USE_INPROC_ENGINE or USE_ASYNC_ENGINE)
+                 else workers + [server_proc])
         for p in procs:
             p.join(timeout=10)
         for p in procs:

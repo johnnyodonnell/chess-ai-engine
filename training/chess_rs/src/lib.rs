@@ -11,6 +11,7 @@
 //! is cozy's "king captures own rook" encoding in the handle (so `push` is
 //! native), but its *policy index* uses python-chess's king-two-squares form.
 
+mod async_mcts;
 mod mcts;
 
 use cozy_chess::{
@@ -596,6 +597,7 @@ const PIECES_BY_INDEX: [Piece; 6] = [
 fn chess_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Board>()?;
     m.add_class::<mcts::MctsEngine>()?;
+    m.add_class::<async_mcts::AsyncMctsEngine>()?;
     m.add_function(wrap_pyfunction!(encode_many, m)?)?;
     Ok(())
 }

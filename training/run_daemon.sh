@@ -42,7 +42,20 @@ export CHESS_BACKEND="${CHESS_BACKEND:-rust_inproc}"
 # -> 27k; gpw=16 + spin (12 workers) -> 67k pos/s (and small gpw = good replay
 # diversity, no warmup). So rust_mcts uses small gpw + spin-wait; the slower
 # paths (python / rust board) pipeline via their own CPU jitter and don't spin.
-if [[ "$CHESS_BACKEND" == "rust_inproc" ]]; then
+ASYNC_ARGS=()
+if [[ "$CHESS_BACKEND" == "rust_async" ]]; then
+  # Multi-threaded native engine: N_THREADS MCTS workers (GIL released) feed ONE
+  # consumer doing big batched in-process forwards — CPU/GPU overlap. CPU
+  # parallelism (ASYNC_N_THREADS) is decoupled from batch width (ASYNC_N_GAMES);
+  # keep N_GAMES >> N_THREADS so batches stay fat. Tune from the throughput sweep.
+  DEFAULT_GPW=16
+  DEFAULT_WORKERS=12
+  ASYNC_ARGS=(
+    --async-n-games "${ASYNC_N_GAMES:-512}"
+    --async-n-threads "${ASYNC_N_THREADS:-18}"
+    --async-max-batch "${ASYNC_MAX_BATCH:-512}"
+  )
+elif [[ "$CHESS_BACKEND" == "rust_inproc" ]]; then
   # Option B: a single self-play process runs MctsEngine.run entirely in Rust
   # and does the forward IN-PROCESS (no inference server, no shm, no spin-wait).
   # games-in-flight (the NN batch width) = WORKERS * GAMES_PER_WORKER.
@@ -72,4 +85,5 @@ exec "$VENV/bin/python" orchestrator.py \
   --workers "${WORKERS:-$DEFAULT_WORKERS}" \
   --games-per-worker "${GAMES_PER_WORKER:-$DEFAULT_GPW}" \
   --sims "${SIMS:-200}" \
+  "${ASYNC_ARGS[@]}" \
   "${INIT_ARGS[@]}"

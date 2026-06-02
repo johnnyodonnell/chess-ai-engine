@@ -210,3 +210,72 @@ def run_selfplay_inproc(out_queue, stop_event, seed, n_games, sims, weights_path
 
     engine = chess_rs.MctsEngine(n_games, sims, seed, True)
     engine.run(forward, sink, should_stop, True)  # refill=True: run until stop
+
+
+def run_selfplay_async(out_queue, stop_event, seed, n_games, sims, weights_path,
+                       n_threads, max_batch, device_str="cuda", reload_every=5.0):
+    """In-process MULTI-THREADED self-play process (CHESS_BACKEND=rust_async).
+
+    Same contract as run_selfplay_inproc — Rust owns the games and calls back
+    into Python ONLY for the in-process GPU forward — but the native engine runs
+    `n_threads` MCTS worker threads (GIL released) over `n_games` game slots,
+    feeding ONE consumer that batches all workers' leaves into big forwards
+    (up to `max_batch` rows). The consumer is the only thread calling `forward`,
+    so the net + mtime-reload state stay single-threaded and race-free, exactly
+    as in run_selfplay_inproc.
+    """
+    import os
+    import queue as _queue
+    import time
+
+    import torch
+
+    import chess_rs
+    from net import ChessNet
+
+    use_cuda = device_str == "cuda" and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    def load_net(path):
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        cfg = ckpt.get("config", {})
+        net = ChessNet(n_blocks=cfg.get("n_blocks"),
+                       n_filters=cfg.get("n_filters")).to(device)
+        net.load_state_dict(ckpt["weights"])
+        net.eval()
+        return net
+
+    state = {"net": load_net(weights_path),
+             "mtime": os.path.getmtime(weights_path),
+             "last_check": time.time()}
+
+    @torch.no_grad()
+    def forward(batch):
+        now = time.time()
+        if now - state["last_check"] >= reload_every:
+            state["last_check"] = now
+            try:
+                m = os.path.getmtime(weights_path)
+                if m > state["mtime"]:
+                    state["net"] = load_net(weights_path)
+                    state["mtime"] = m
+            except (OSError, KeyError):
+                pass  # mid-write / transient — retry next check
+        x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
+        logits, values = state["net"](x)
+        return logits.float().cpu().numpy(), values.float().cpu().numpy()
+
+    def sink(rows, n_finished):
+        item = (rows, n_finished, len(rows) / max(1, n_finished))
+        while not should_stop():
+            try:
+                out_queue.put(item, timeout=0.5)
+                return
+            except _queue.Full:
+                pass
+
+    def should_stop():
+        return stop_event.is_set() or os.getppid() == 1
+
+    engine = chess_rs.AsyncMctsEngine(n_games, sims, seed, True, n_threads, max_batch)
+    engine.run(forward, sink, should_stop, True)  # refill=True: run until stop
