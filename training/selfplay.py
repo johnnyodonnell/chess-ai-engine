@@ -190,6 +190,12 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
                        n_filters=cfg.get("n_filters")).to(device)
         net.load_state_dict(ckpt["weights"])
         net.eval()
+        if BF16:
+            # Pure bf16 weights (NOT autocast): on this overhead-bound net,
+            # autocast's inserted cast ops cost extra launches. Benchmarked ~2.3x
+            # on the forward vs fp32 on the compiled path; channels_last adds
+            # nothing once compiled (Inductor picks its own layout), so we skip it.
+            net = net.bfloat16()
         return net
 
     # CHESS_COMPILE=1 wraps the net in torch.compile. The net is tiny (4x96), so
@@ -197,6 +203,10 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
     # ops into a few kernels. Default mode (max-autotune is unsupported on GB10;
     # CUDA-graphs/reduce-overhead deferred — it constrains input addresses).
     COMPILE = os.environ.get("CHESS_COMPILE", "0") == "1"
+    # CHESS_BF16=1 runs the net in bfloat16 (see load_net). bf16 is numerically
+    # safe for inference (fp32 exponent range), but breaks bit-reproducibility and
+    # can flip argmax on near-tied positions — keep evaluate.py in fp32.
+    BF16 = os.environ.get("CHESS_BF16", "0") == "1"
 
     eager_net = load_net(weights_path)  # persistent module; reloaded IN PLACE
     state = {"net": torch.compile(eager_net) if COMPILE else eager_net,
@@ -205,7 +215,7 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
              "last_check": time.time(),
              "warned_shape": False}
     print(f"rust_pipeline: torch.compile={'ON' if COMPILE else 'OFF'} "
-          f"bucket={bucket_size}", flush=True)
+          f"bf16={'ON' if BF16 else 'OFF'} bucket={bucket_size}", flush=True)
 
     def reload_weights(path):
         # In-place state_dict swap into the persistent (possibly compiled) module
@@ -240,6 +250,8 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
             print(f"rust_pipeline: forward batch={batch.shape[0]} != "
                   f"bucket={bucket_size}; torch.compile may recompile", flush=True)
         x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
+        if BF16:
+            x = x.bfloat16()
         logits, values = state["net"](x)
         return logits.float().cpu().numpy(), values.float().cpu().numpy()
 
