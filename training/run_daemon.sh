@@ -34,6 +34,13 @@ export CHESS_BACKEND="${CHESS_BACKEND:-rust_pipeline}"
 # rollback with `CHESS_COMPILE=0 pm2 restart chess-train --update-env`.
 export CHESS_COMPILE="${CHESS_COMPILE:-1}"
 
+# Run the in-process self-play forward in bfloat16 (rust_pipeline). Pure bf16
+# weights (not autocast) on the tiny 4x96 net; stacks on top of torch.compile.
+# Measured ~1.7x completed games/sec on the GB10, steady-state, with the
+# self-play game distribution unchanged (avg plies converges). Default ON;
+# rollback with `CHESS_BF16=0 pm2 restart chess-train --update-env`.
+export CHESS_BF16="${CHESS_BF16:-1}"
+
 # Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
 # in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
 # decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).
