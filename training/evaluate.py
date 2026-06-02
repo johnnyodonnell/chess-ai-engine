@@ -213,30 +213,13 @@ def _select_anchors(ratings, models, n_top, n_anchors):
     return active, top
 
 
-def resolve_device(spec):
-    """Map a --device spec to a torch.device.
-
-    'cuda' -> GPU; errors out if CUDA is unavailable rather than silently
-              falling back to CPU, so a misconfig is visible.
-    'cpu'  -> always CPU (lets eval inference run off the GPU that self-play
-              and SGD are using, trading wall-time for GPU contention).
-    'auto' -> GPU if available else CPU (legacy standalone behavior).
-    """
-    if spec == "cuda":
-        if not torch.cuda.is_available():
-            raise SystemExit("[eval] --device cuda requested but CUDA is unavailable")
-        return torch.device("cuda")
-    if spec == "cpu":
-        return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 def evaluate(run_dir, candidate, games_per_pair, sims, opening_plies,
-             n_top, n_anchors, serve_margin, seed, device):
+             n_top, n_anchors, serve_margin, seed):
     run_dir = Path(run_dir)
     pool_path = run_dir / "pool.json"
     pool = _load_pool(pool_path)
     rng = np.random.default_rng(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     cand_pt = Path(candidate)
     cand_name = cand_pt.stem
@@ -338,22 +321,18 @@ def main():
     ap.add_argument("--games-per-pair", type=int, default=100)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--opening-plies", type=int, default=10)
-    ap.add_argument("--n-top", type=int, default=2)
-    ap.add_argument("--n-anchors", type=int, default=3)
+    ap.add_argument("--n-top", type=int, default=3)
+    ap.add_argument("--n-anchors", type=int, default=4)
     ap.add_argument("--serve-margin", type=float, default=35.0,
                     help="Elo the leader must beat the served model by to be "
                          "promoted (≈ rating standard error at 100 games).")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
-                    help="Where to run net inference. 'cuda' keeps eval on the "
-                         "GPU; 'cpu' runs it off-GPU to avoid contending with "
-                         "training; 'auto' uses GPU if available.")
     args = ap.parse_args()
 
     evaluate(
         args.run_dir, args.candidate, args.games_per_pair, args.sims,
         args.opening_plies, args.n_top, args.n_anchors, args.serve_margin,
-        args.seed, resolve_device(args.device),
+        args.seed,
     )
 
 

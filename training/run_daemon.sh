@@ -70,6 +70,5 @@ exec "$VENV/bin/python" orchestrator.py \
   --workers "${WORKERS:-12}" \
   --games-per-worker "${GAMES_PER_WORKER:-16}" \
   --sims "${SIMS:-200}" \
-  --eval-device "${EVAL_DEVICE:-cpu}" \
   "${ENGINE_ARGS[@]}" \
   "${INIT_ARGS[@]}"

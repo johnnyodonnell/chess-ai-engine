@@ -96,12 +96,6 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=float, default=30.0)
-    ap.add_argument("--eval-device", choices=["auto", "cpu", "cuda"],
-                    default="cpu",
-                    help="Device for the evaluator subprocess's net inference. "
-                         "Defaults to cpu to keep eval off the GPU that "
-                         "self-play and SGD use; set to cuda to run eval on the "
-                         "GPU if CPU eval becomes the bottleneck.")
     return ap.parse_args()
 
 
@@ -262,8 +256,7 @@ def main():
         try:
             proc = subprocess.Popen(
                 [sys.executable, "evaluate.py",
-                 "--run-dir", str(out_dir), "--candidate", str(pt_path),
-                 "--device", args.eval_device],
+                 "--run-dir", str(out_dir), "--candidate", str(pt_path)],
                 cwd=str(training_dir), stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
