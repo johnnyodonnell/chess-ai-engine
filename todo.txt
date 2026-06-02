@@ -1,0 +1,5 @@
+- Retire legacy training/loop.py (superseded by orchestrator.py; not invoked by run_daemon.sh).
+  Its indefinite mode is already bin-rotted: it calls play_batch(net, device, ...) but the
+  signature is play_batch(evaluator, n_games, n_sims, rng=None). When removing it, also:
+    - Update README.md:75 (still lists loop.py as "the orchestrator") to point at orchestrator.py
+    - Clean up stale doc comments referencing loop.py (selfplay.py, evaluator.py, evaluate.py, run_daemon.sh)
