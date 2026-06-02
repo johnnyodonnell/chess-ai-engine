@@ -423,14 +423,21 @@ type ScatterMsg = (PyObject, Vec<Box<InFlight>>);
 fn scatter_loop(shared: Arc<Shared>, rx: Receiver<ScatterMsg>) {
     // Exits when the consumer drops the sender (recv -> Err) — i.e. on shutdown.
     while let Ok((result, games)) = rx.recv() {
-        let extracted = Python::with_gil(|py| -> PyResult<(Vec<f32>, Vec<f32>)> {
+        // Hold the GIL only to validate the arrays and grab their raw buffer
+        // pointers (microseconds). The big memcpy then runs with the GIL RELEASED,
+        // so it overlaps the consumer's NEXT forward (which holds the GIL) — this
+        // is what actually closes the GPU-idle gap. Relocating a GIL-HELD copy to
+        // this thread (the prior version) did not, since one thread holds the GIL.
+        let ptrs = Python::with_gil(|py| -> PyResult<(*const f32, usize, *const f32, usize)> {
             let bound = result.bind(py);
             let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
                 bound.extract()?;
-            Ok((logits.as_slice()?.to_vec(), values.as_slice()?.to_vec()))
+            let l = logits.as_slice()?; // validates C-contiguity
+            let v = values.as_slice()?;
+            Ok((l.as_ptr(), l.len(), v.as_ptr(), v.len()))
         });
-        let (logits_flat, values_flat) = match extracted {
-            Ok(v) => v,
+        let (lptr, llen, vptr, vlen) = match ptrs {
+            Ok(p) => p,
             Err(e) => {
                 // `forward` returned an unexpected shape/type. Fail the run rather
                 // than silently mis-route corrupted targets into training.
@@ -441,6 +448,15 @@ fn scatter_loop(shared: Arc<Shared>, rx: Receiver<ScatterMsg>) {
                 return;
             }
         };
+        // SAFETY: `result` (dropped below, after the copy) keeps both numpy arrays
+        // and their data buffers alive; numpy never relocates an array's buffer,
+        // and nothing mutates these freshly-produced arrays. GIL is released here,
+        // so this runs concurrently with the consumer's next GIL-held forward.
+        let logits_flat = unsafe { std::slice::from_raw_parts(lptr, llen) }.to_vec();
+        let values_flat = unsafe { std::slice::from_raw_parts(vptr, vlen) }.to_vec();
+        // Done reading numpy; drop the Py result (the decref needs the GIL).
+        Python::with_gil(|_py| drop(result));
+
         let logits = Arc::new(logits_flat);
         let mut q = shared.queue.lock().unwrap();
         for (r, mut g) in games.into_iter().enumerate() {
