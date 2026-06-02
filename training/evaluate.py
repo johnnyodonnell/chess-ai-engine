@@ -2,7 +2,7 @@
 
 Domain-general, purely self-play: no rules engines, no external reference.
 Each invocation evaluates one candidate snapshot against the active pool
-(3 top performers + a fixed random anchor + 4 frozen ex-snapshot anchors
+(2 top performers + a fixed random anchor + 3 frozen ex-snapshot anchors
 spread across the strength range), refits a lightweight Elo over all
 accumulated match results (random pinned at 0), updates the pool, and
 promotes the highest-rated model to `<run-dir>/best.onnx` if it clears the
@@ -234,7 +234,7 @@ def evaluate(run_dir, candidate, games_per_pair, sims, opening_plies,
     }
     pool["models"].setdefault(RANDOM, {"pt": None, "onnx": None, "rating": 0.0})
 
-    # Pick the active opponent set from prior ratings (top-3 + random + anchors).
+    # Pick the active opponent set from prior ratings (top-2 + random + anchors).
     prior = {m: (pool["models"][m].get("rating") or 0.0) for m in pool["models"]}
     active, _ = _select_anchors(prior, list(pool["models"]), n_top, n_anchors)
     opponents = [m for m in active if m != cand_name]
@@ -321,8 +321,8 @@ def main():
     ap.add_argument("--games-per-pair", type=int, default=100)
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--opening-plies", type=int, default=10)
-    ap.add_argument("--n-top", type=int, default=3)
-    ap.add_argument("--n-anchors", type=int, default=4)
+    ap.add_argument("--n-top", type=int, default=2)
+    ap.add_argument("--n-anchors", type=int, default=3)
     ap.add_argument("--serve-margin", type=float, default=35.0,
                     help="Elo the leader must beat the served model by to be "
                          "promoted (≈ rating standard error at 100 games).")
