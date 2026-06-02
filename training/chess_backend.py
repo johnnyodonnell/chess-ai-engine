@@ -87,24 +87,19 @@ class PyBoard:
         return 0.0 if oc.winner is None else -1.0
 
 
-# rust_mcts: the self-play worker drives the native MctsEngine (see
-# selfplay.play_batch_rust); evaluation keeps using the Python MCTS on the same
-# native Board, so it shares the `rust` board path here.
-USE_RUST_ENGINE = BACKEND == "rust_mcts"
-
-# rust_inproc: a single self-play process drives the native MctsEngine.run loop
-# entirely in Rust, calling the torch net IN-PROCESS for the forward (no shm /
-# inference server / spin-wait). See selfplay.run_selfplay_inproc. Shares the
-# native `rust` board path.
-USE_INPROC_ENGINE = BACKEND == "rust_inproc"
-
-# rust_async: like rust_inproc but the native engine runs MANY MCTS worker
-# threads (GIL released) feeding ONE consumer that does big batched in-process
-# forwards — CPU/GPU overlap for higher games/sec. See selfplay.run_selfplay_async
+# rust_async: the native engine runs MANY MCTS worker threads (GIL released)
+# feeding ONE consumer that does big batched in-process forwards — CPU/GPU
+# overlap for higher games/sec (the A/B baseline). See selfplay.run_selfplay_async
 # and chess_rs::AsyncMctsEngine. Shares the native `rust` board path.
 USE_ASYNC_ENGINE = BACKEND == "rust_async"
 
-if BACKEND in ("rust", "rust_mcts", "rust_inproc", "rust_async"):
+# rust_pipeline: the decoupled non-blocking engine — workers never block on the
+# GPU; two inference buckets feed ONE consumer, with a global ply-priority queue
+# and dynamic game spawning. See selfplay.run_selfplay_pipeline and
+# chess_rs::PipelineEngine. Shares the native `rust` board path.
+USE_PIPELINE_ENGINE = BACKEND == "rust_pipeline"
+
+if BACKEND in ("rust", "rust_async", "rust_pipeline"):
     import chess_rs
 
     _Board = chess_rs.Board

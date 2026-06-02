@@ -1,18 +1,22 @@
 """Parallel self-play orchestrator (Path B).
 
-Runs the trainer in this (main) process and spawns:
-  - one inference server  (infer_server.run_server) — holds the net on the GPU
-  - N self-play workers   (selfplay.run_worker)     — torch-free, CPU-only MCTS
+Runs the trainer in this (main) process and spawns ONE in-process self-play
+process running a native engine that holds the net on the GPU and does its own
+batched in-process forwards — no separate inference server, no shared-memory
+channels. Select the engine via CHESS_BACKEND:
+  - rust_pipeline : decoupled non-blocking pipeline (workers never block on the
+                    GPU; two inference buckets feed one consumer).
+  - rust_async    : bulk-synchronous multi-threaded engine (A/B baseline).
 
-Workers ship leaf positions to the server over shared-memory channels and push
-finished (state, pi, z) tuples onto a bounded queue; the trainer drains that
-queue into a ring ReplayBuffer, runs SGD, and periodically publishes fresh
-weights to a file the server reloads. Snapshots / latest.pt / detached eval are
-unchanged from loop.py (same checkpoint format → resumes the run1 checkpoint).
+The self-play process pushes finished (state, pi, z) tuples onto a bounded queue;
+the trainer drains that queue into a ring ReplayBuffer, runs SGD, and periodically
+publishes fresh weights to a file the self-play side reloads on mtime change.
+Snapshots / latest.pt / detached eval are unchanged from loop.py (same checkpoint
+format → resumes the run1 checkpoint).
 
 IMPORTANT: module-level imports are kept torch-free. `spawn` re-imports this
 module in every child (to set up __main__), so importing torch here would pull
-torch into the CPU-only workers. All torch imports live inside main().
+torch into the CPU-only self-play process. All torch imports live inside main().
 """
 
 import argparse
@@ -28,9 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
-from chess_backend import USE_ASYNC_ENGINE, USE_INPROC_ENGINE
-from evaluator import make_channels, unlink_blocks
-from selfplay import run_selfplay_async, run_selfplay_inproc, run_worker
+from chess_backend import USE_ASYNC_ENGINE, USE_PIPELINE_ENGINE
+from selfplay import run_selfplay_async, run_selfplay_pipeline
 
 
 def parse_duration(spec):
@@ -55,7 +58,7 @@ def parse_args():
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often the trainer republishes weights for the "
-                         "inference server to reload.")
+                         "self-play process to reload.")
     # self-play workers
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--games-per-worker", type=int, default=16)
@@ -70,6 +73,12 @@ def parse_args():
     ap.add_argument("--async-max-batch", type=int, default=None,
                     help="rust_async: max rows per GPU forward. Defaults to "
                          "async-n-games.")
+    # rust_pipeline knobs (decoupled non-blocking engine; one batch-width knob)
+    ap.add_argument("--pipeline-bucket-size", type=int, default=512,
+                    help="rust_pipeline: GPU batch width per forward (the single "
+                         "tuning knob; in-flight games self-regulate to ~2x this).")
+    ap.add_argument("--pipeline-n-threads", type=int, default=16,
+                    help="rust_pipeline: MCTS worker threads.")
     # training
     ap.add_argument("--buffer-capacity", type=int, default=200_000)
     ap.add_argument("--min-buffer-for-train", type=int, default=2_000)
@@ -77,7 +86,7 @@ def parse_args():
     ap.add_argument("--target-reuse", type=float, default=4.0,
                     help="Avg times each generated sample is used in training. "
                          "Paces SGD to the self-play data rate so the trainer "
-                         "doesn't starve the inference server of GPU, and bounds "
+                         "doesn't starve self-play of GPU, and bounds "
                          "overfitting. 4 follows KataGo's tuned cap (<=4/row); "
                          "AlphaZero used ~0.5 (compute-rich), Leela ~10 (flagged "
                          "as over-sampling). loop.py's implicit ratio was ~6.7.")
@@ -98,7 +107,6 @@ def main():
     from net import ChessNet, N_BLOCKS, N_FILTERS, n_params
     from train import ReplayBuffer, train_step
     from export import export
-    from infer_server import run_server
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -261,19 +269,36 @@ def main():
 
     launch_eval.proc = None
 
-    # ----- Spawn self-play (+ inference server, unless in-process) -----
+    # ----- Spawn the in-process self-play engine -----
     publish_weights()  # initial: the net source the self-play side loads/reloads
 
     ctx = mp.get_context("spawn")
     out_queue = ctx.Queue(maxsize=args.queue_max)
     stop = ctx.Event()
 
-    if USE_ASYNC_ENGINE:
+    if USE_PIPELINE_ENGINE:
+        # rust_pipeline: ONE self-play process runs the decoupled non-blocking
+        # engine — workers never block on the GPU; two inference buckets feed one
+        # consumer. Dynamic game count; bucket size is the only batch-width knob.
+        def start_selfplay():
+            p = ctx.Process(
+                target=run_selfplay_pipeline,
+                args=(out_queue, stop, args.seed + 1000, args.sims,
+                      str(serving_path), args.pipeline_n_threads,
+                      args.pipeline_bucket_size, str(device)),
+            )
+            p.start()
+            return p
+
+        print(f"spawned 1 pipeline self-play process "
+              f"(threads={args.pipeline_n_threads} "
+              f"bucket={args.pipeline_bucket_size} sims={args.sims}); "
+              f"no inference server", flush=True)
+    elif USE_ASYNC_ENGINE:
         # rust_async: ONE self-play process runs the native multi-threaded engine
         # (n_threads MCTS workers + 1 batching consumer doing in-process forwards)
         # — no inference server, no shm. CPU parallelism (n_threads) is decoupled
         # from batch width (n_games), so we can keep the GPU fed AND use all cores.
-        channels, blocks = [], []
         n_games = args.async_n_games or (args.workers * args.games_per_worker)
         n_threads = args.async_n_threads or max(1, (os.cpu_count() or 2) - 2)
         max_batch = args.async_max_batch or n_games
@@ -287,62 +312,16 @@ def main():
             p.start()
             return p
 
-        selfplay_proc = start_selfplay()
-        server_proc, workers = None, []
         print(f"spawned 1 async self-play process (games={n_games} "
               f"threads={n_threads} max_batch={max_batch} sims={args.sims}); "
               f"no inference server", flush=True)
-    elif USE_INPROC_ENGINE:
-        # Option B: ONE self-play process runs the whole MctsEngine.run loop and
-        # does the forward in-process — no inference server, no shm channels, no
-        # spin-wait. Total games-in-flight (the NN batch width) = workers * gpw,
-        # so the existing concurrency knobs carry over.
-        channels, blocks = [], []
-        n_inproc_games = args.workers * args.games_per_worker
-
-        def start_selfplay():
-            p = ctx.Process(
-                target=run_selfplay_inproc,
-                args=(out_queue, stop, args.seed + 1000, n_inproc_games,
-                      args.sims, str(serving_path), str(device)),
-            )
-            p.start()
-            return p
-
-        selfplay_proc = start_selfplay()
-        server_proc, workers = None, []
-        print(f"spawned 1 in-process self-play process (games={n_inproc_games} "
-              f"sims={args.sims}); no inference server", flush=True)
     else:
-        channels, blocks = make_channels(ctx, args.workers, args.games_per_worker)
-        server_ready = ctx.Event()
+        raise SystemExit(
+            "orchestrator requires an in-process self-play backend; set "
+            "CHESS_BACKEND=rust_pipeline (or rust_async)."
+        )
 
-        def start_server():
-            server_ready.clear()
-            p = ctx.Process(
-                target=run_server,
-                args=(channels, str(serving_path), stop, str(device)),
-                kwargs={"ready_event": server_ready},
-            )
-            p.start()
-            if not server_ready.wait(180):
-                print("warn: inference server slow to report ready", flush=True)
-            return p
-
-        def start_worker(idx):
-            p = ctx.Process(
-                target=run_worker,
-                args=(channels[idx], out_queue, stop, args.seed + 1000 + idx,
-                      args.games_per_worker, args.sims),
-            )
-            p.start()
-            return p
-
-        server_proc = start_server()
-        workers = [start_worker(i) for i in range(args.workers)]
-        selfplay_proc = None
-        print(f"spawned 1 inference server + {args.workers} workers "
-              f"(games/worker={args.games_per_worker} sims={args.sims})", flush=True)
+    selfplay_proc = start_selfplay()
 
     # ----- Clock / snapshot schedule (mirror loop.py) -----
     start = time.time()
@@ -369,19 +348,10 @@ def main():
     net.train()
     try:
         while True:
-            # Supervise children — restart any that died.
-            if USE_INPROC_ENGINE or USE_ASYNC_ENGINE:
-                if not selfplay_proc.is_alive():
-                    print("warn: self-play process died; restarting", flush=True)
-                    selfplay_proc = start_selfplay()
-            else:
-                if not server_proc.is_alive():
-                    print("warn: inference server died; restarting", flush=True)
-                    server_proc = start_server()
-                for i, p in enumerate(workers):
-                    if not p.is_alive():
-                        print(f"warn: worker {i} died; restarting", flush=True)
-                        workers[i] = start_worker(i)
+            # Supervise the self-play process — restart if it died.
+            if not selfplay_proc.is_alive():
+                print("warn: self-play process died; restarting", flush=True)
+                selfplay_proc = start_selfplay()
 
             # Snapshot if due.
             if elapsed() >= next_snapshot_at:
@@ -417,7 +387,7 @@ def main():
 
             # SGD, paced to the data rate: keep cumulative samples-trained near
             # target_reuse x samples-generated. This stops the trainer from
-            # hogging the GPU the inference server needs, and bounds overfitting.
+            # hogging the GPU self-play needs, and bounds overfitting.
             train_loss = None
             cycle_tr_time = 0.0
             allowed = int(gen_samples * args.target_reuse / args.batch_size) - session_steps
@@ -467,16 +437,11 @@ def main():
                 }), flush=True)
                 last_log = now
     finally:
-        print("shutting down: signaling workers + server", flush=True)
+        print("shutting down: signaling self-play", flush=True)
         stop.set()
-        procs = ([selfplay_proc] if (USE_INPROC_ENGINE or USE_ASYNC_ENGINE)
-                 else workers + [server_proc])
-        for p in procs:
-            p.join(timeout=10)
-        for p in procs:
-            if p.is_alive():
-                p.terminate()
-        unlink_blocks(blocks)
+        selfplay_proc.join(timeout=10)
+        if selfplay_proc.is_alive():
+            selfplay_proc.terminate()
 
 
 if __name__ == "__main__":

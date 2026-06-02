@@ -2,19 +2,17 @@
 # pm2 entrypoint for indefinite self-play training (parallel orchestrator, Path B).
 # Run from the repo root: pm2 start training/run_daemon.sh --name chess-train \
 #                           --kill-timeout 20000
-# The orchestrator runs N CPU-only self-play workers feeding one GPU inference
-# server, with the trainer pacing SGD to the data rate. It resumes runs/run1's
-# latest.pt (checkpoint format is shared with the legacy loop.py).
-# Rollback: swap `orchestrator.py ...` back to `loop.py --snapshot-every 4h
-# --save-latest-every 300s --out-dir "$OUT_DIR"` and restart.
+# The orchestrator runs ONE in-process native self-play engine (Rust owns the
+# games and does the GPU forward IN-PROCESS — no inference server, no shm) plus
+# the trainer pacing SGD to the data rate. It resumes runs/run1's latest.pt
+# (checkpoint format is shared with the legacy loop.py).
 #
-# Self-play backend: in-process native engine (chess_rs, CHESS_BACKEND=rust_inproc)
-# by default — one self-play process runs the whole MctsEngine.run loop in Rust
-# and does the GPU forward IN-PROCESS (no inference server, no shm channels, no
-# spin-wait). Bit-identical games to rust_mcts (test_rust_inproc.py); A/B showed
-# throughput parity at ~1/10 the CPU (no spin). Instant rollback to the previous
-# path: `CHESS_BACKEND=rust_mcts pm2 restart chess-train --update-env` (server +
-# workers + spin-wait), or rust / python for the reference paths.
+# Self-play backend (CHESS_BACKEND):
+#   rust_pipeline (default) — decoupled non-blocking pipeline: workers never block
+#     on the GPU; a global ply-priority queue feeds two inference buckets that one
+#     consumer batches; dynamic game count (bucket size is the one batch-width knob).
+#   rust_async — bulk-synchronous multi-threaded engine (the A/B baseline).
+# Switch/rollback: `CHESS_BACKEND=rust_async pm2 restart chess-train --update-env`.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,53 +26,27 @@ if [[ -n "${INIT_FROM:-}" ]]; then
   INIT_ARGS=(--init-from "$INIT_FROM")
 fi
 
-export CHESS_BACKEND="${CHESS_BACKEND:-rust_inproc}"
+export CHESS_BACKEND="${CHESS_BACKEND:-rust_pipeline}"
 
-# Self-play concurrency + IPC. rust_mcts makes a worker's per-sim CPU work
-# negligible, so workers fall into a lockstep "convoy" on the central GPU
-# inference server: it runs a batched forward, then idles waiting for the whole
-# convoy to wake (mp.Event futex -> scheduler wakeup) and resubmit together. Two
-# ways to fight the resulting GPU starvation:
-#   1. Huge games-per-worker (gpw=96) to amortize the idle — works (~49k pos/s)
-#      but couples gpw to GPU efficiency, hurting replay diversity / burstiness.
-#   2. Spin-wait the round trip so a SMALL gpw saturates the GPU (below).
-# Measured on run1's net (200 sims): gpw=96 no-spin -> 49k pos/s; gpw=16 no-spin
-# -> 27k; gpw=16 + spin (12 workers) -> 67k pos/s (and small gpw = good replay
-# diversity, no warmup). So rust_mcts uses small gpw + spin-wait; the slower
-# paths (python / rust board) pipeline via their own CPU jitter and don't spin.
-ASYNC_ARGS=()
-if [[ "$CHESS_BACKEND" == "rust_async" ]]; then
-  # Multi-threaded native engine: N_THREADS MCTS workers (GIL released) feed ONE
-  # consumer doing big batched in-process forwards — CPU/GPU overlap. CPU
-  # parallelism (ASYNC_N_THREADS) is decoupled from batch width (ASYNC_N_GAMES);
-  # keep N_GAMES >> N_THREADS so batches stay fat. Tune from the throughput sweep.
-  DEFAULT_GPW=16
-  DEFAULT_WORKERS=12
-  ASYNC_ARGS=(
+# Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
+# in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
+# decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).
+ENGINE_ARGS=()
+if [[ "$CHESS_BACKEND" == "rust_pipeline" ]]; then
+  ENGINE_ARGS=(
+    --pipeline-bucket-size "${PIPELINE_BUCKET_SIZE:-512}"
+    --pipeline-n-threads "${PIPELINE_N_THREADS:-16}"
+  )
+elif [[ "$CHESS_BACKEND" == "rust_async" ]]; then
+  ENGINE_ARGS=(
     --async-n-games "${ASYNC_N_GAMES:-512}"
     --async-n-threads "${ASYNC_N_THREADS:-18}"
     --async-max-batch "${ASYNC_MAX_BATCH:-512}"
   )
-elif [[ "$CHESS_BACKEND" == "rust_inproc" ]]; then
-  # Option B: a single self-play process runs MctsEngine.run entirely in Rust
-  # and does the forward IN-PROCESS (no inference server, no shm, no spin-wait).
-  # games-in-flight (the NN batch width) = WORKERS * GAMES_PER_WORKER.
-  DEFAULT_GPW=16
-  DEFAULT_WORKERS=12
-elif [[ "$CHESS_BACKEND" == "rust_mcts" ]]; then
-  DEFAULT_GPW=16
-  DEFAULT_WORKERS=12
-  # Hybrid spin-wait: worker busy-checks the response for INFER_SPIN_US us before
-  # blocking; server busy-polls (INFER_IDLE_SLEEP=0) so a returning convoy is
-  # noticed immediately. Costs CPU (workers spin through the ~2ms forward) but
-  # the cores would otherwise sit idle on a dedicated box. Disable by exporting
-  # INFER_SPIN_US=0. The spin budget must exceed the forward time to catch the
-  # response without sleeping; ~3ms suits run1's net at these batch sizes.
-  export INFER_SPIN_US="${INFER_SPIN_US:-3000}"
-  export INFER_IDLE_SLEEP="${INFER_IDLE_SLEEP:-0}"
 else
-  DEFAULT_GPW=16
-  DEFAULT_WORKERS=20
+  echo "run_daemon.sh: CHESS_BACKEND must be rust_pipeline or rust_async" \
+       "(got '$CHESS_BACKEND')" >&2
+  exit 1
 fi
 
 cd "$REPO_DIR/training"
@@ -82,8 +54,8 @@ exec "$VENV/bin/python" orchestrator.py \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --save-latest-every 300s \
   --out-dir "$OUT_DIR" \
-  --workers "${WORKERS:-$DEFAULT_WORKERS}" \
-  --games-per-worker "${GAMES_PER_WORKER:-$DEFAULT_GPW}" \
+  --workers "${WORKERS:-12}" \
+  --games-per-worker "${GAMES_PER_WORKER:-16}" \
   --sims "${SIMS:-200}" \
-  "${ASYNC_ARGS[@]}" \
+  "${ENGINE_ARGS[@]}" \
   "${INIT_ARGS[@]}"

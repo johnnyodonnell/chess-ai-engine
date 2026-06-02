@@ -13,6 +13,7 @@
 
 mod async_mcts;
 mod mcts;
+mod pipeline;
 
 use cozy_chess::{
     BitBoard, Board as CzBoard, Color, File, Move, Piece, Rank, Square,
@@ -598,6 +599,7 @@ fn chess_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Board>()?;
     m.add_class::<mcts::MctsEngine>()?;
     m.add_class::<async_mcts::AsyncMctsEngine>()?;
+    m.add_class::<pipeline::PipelineEngine>()?;
     m.add_function(wrap_pyfunction!(encode_many, m)?)?;
     Ok(())
 }

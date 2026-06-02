@@ -11,6 +11,8 @@ VENV="/home/johnny/Workspace/chess-ai-engine/training/.venv"
 OUT_DIR="$REPO_DIR/runs/dev1"
 INIT_FROM="${INIT_FROM:-/home/johnny/Workspace/chess-ai-engine/runs/run1/latest.pt}"
 
+export CHESS_BACKEND="${CHESS_BACKEND:-rust_pipeline}"
+
 cd "$REPO_DIR/training"
 exec "$VENV/bin/python" orchestrator.py \
   --out-dir "$OUT_DIR" \
@@ -18,4 +20,6 @@ exec "$VENV/bin/python" orchestrator.py \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --workers "${WORKERS:-12}" \
   --games-per-worker "${GAMES_PER_WORKER:-16}" \
-  --sims "${SIMS:-200}"
+  --sims "${SIMS:-200}" \
+  --pipeline-bucket-size "${PIPELINE_BUCKET_SIZE:-512}" \
+  --pipeline-n-threads "${PIPELINE_N_THREADS:-16}"
