@@ -28,6 +28,12 @@ fi
 
 export CHESS_BACKEND="${CHESS_BACKEND:-rust_pipeline}"
 
+# torch.compile the in-process self-play forward (rust_pipeline). The net is tiny
+# (4x96), so eager mode is dominated by per-op dispatch overhead; compile fuses it
+# into a few kernels. Measured +29% completed games/sec on the GB10. Default ON;
+# rollback with `CHESS_COMPILE=0 pm2 restart chess-train --update-env`.
+export CHESS_COMPILE="${CHESS_COMPILE:-1}"
+
 # Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
 # in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
 # decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).

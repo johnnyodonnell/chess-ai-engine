@@ -192,9 +192,36 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
         net.eval()
         return net
 
-    state = {"net": load_net(weights_path),
+    # CHESS_COMPILE=1 wraps the net in torch.compile. The net is tiny (4x96), so
+    # eager mode is dominated by per-op dispatch overhead; compile fuses the ~17
+    # ops into a few kernels. Default mode (max-autotune is unsupported on GB10;
+    # CUDA-graphs/reduce-overhead deferred — it constrains input addresses).
+    COMPILE = os.environ.get("CHESS_COMPILE", "0") == "1"
+
+    eager_net = load_net(weights_path)  # persistent module; reloaded IN PLACE
+    state = {"net": torch.compile(eager_net) if COMPILE else eager_net,
+             "eager": eager_net,
              "mtime": os.path.getmtime(weights_path),
-             "last_check": time.time()}
+             "last_check": time.time(),
+             "warned_shape": False}
+    print(f"rust_pipeline: torch.compile={'ON' if COMPILE else 'OFF'} "
+          f"bucket={bucket_size}", flush=True)
+
+    def reload_weights(path):
+        # In-place state_dict swap into the persistent (possibly compiled) module
+        # so torch.compile does NOT retrace on every weight publish (~15s). The
+        # compiled graph captured these param tensors; load_state_dict copies into
+        # them, so fresh weights are picked up without recompiling.
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        try:
+            state["eager"].load_state_dict(ckpt["weights"])
+            state["eager"].eval()
+        except RuntimeError:
+            # Architecture changed (shouldn't happen within a run): rebuild +
+            # recompile rather than crash.
+            eager = load_net(path)
+            state["eager"] = eager
+            state["net"] = torch.compile(eager) if COMPILE else eager
 
     @torch.no_grad()
     def forward(batch):
@@ -204,10 +231,14 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
             try:
                 m = os.path.getmtime(weights_path)
                 if m > state["mtime"]:
-                    state["net"] = load_net(weights_path)
+                    reload_weights(weights_path)
                     state["mtime"] = m
             except (OSError, KeyError):
                 pass  # mid-write / transient — retry next check
+        if batch.shape[0] != bucket_size and not state["warned_shape"]:
+            state["warned_shape"] = True
+            print(f"rust_pipeline: forward batch={batch.shape[0]} != "
+                  f"bucket={bucket_size}; torch.compile may recompile", flush=True)
         x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
         logits, values = state["net"](x)
         return logits.float().cpu().numpy(), values.float().cpu().numpy()
