@@ -178,6 +178,7 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
     import torch
 
     import chess_rs
+    import zerocopy
     from net import ChessNet
 
     use_cuda = device_str == "cuda" and torch.cuda.is_available()
@@ -214,8 +215,17 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
              "mtime": os.path.getmtime(weights_path),
              "last_check": time.time(),
              "warned_shape": False}
+    # Zero-copy host I/O ring (GB10/ATS): Rust writes bf16 inputs + reads bf16
+    # outputs from pinned host slots the GPU accesses in place, eliminating the
+    # per-forward H2D and the blocking D2H. Needs CUDA + bf16; otherwise we keep
+    # the legacy numpy path (also used by the routing test). See zerocopy.py.
+    N_SLOTS = int(os.environ.get("CHESS_RING_SLOTS", "6"))
+    ZEROCOPY = os.environ.get("CHESS_ZEROCOPY", "1") == "1"
+    ring = (zerocopy.HostRing(N_SLOTS, bucket_size)
+            if (use_cuda and BF16 and ZEROCOPY) else None)
     print(f"rust_pipeline: torch.compile={'ON' if COMPILE else 'OFF'} "
-          f"bf16={'ON' if BF16 else 'OFF'} bucket={bucket_size}", flush=True)
+          f"bf16={'ON' if BF16 else 'OFF'} bucket={bucket_size} "
+          f"zerocopy_ring={'ON('+str(N_SLOTS)+')' if ring else 'OFF'}", flush=True)
 
     def reload_weights(path):
         # In-place state_dict swap into the persistent (possibly compiled) module
@@ -233,8 +243,7 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
             state["eager"] = eager
             state["net"] = torch.compile(eager) if COMPILE else eager
 
-    @torch.no_grad()
-    def forward(batch):
+    def maybe_reload():
         now = time.time()
         if now - state["last_check"] >= reload_every:
             state["last_check"] = now
@@ -245,15 +254,37 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
                     state["mtime"] = m
             except (OSError, KeyError):
                 pass  # mid-write / transient — retry next check
-        if batch.shape[0] != bucket_size and not state["warned_shape"]:
-            state["warned_shape"] = True
-            print(f"rust_pipeline: forward batch={batch.shape[0]} != "
-                  f"bucket={bucket_size}; torch.compile may recompile", flush=True)
-        x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
-        if BF16:
-            x = x.bfloat16()
-        logits, values = state["net"](x)
-        return logits.float().cpu().numpy(), values.float().cpu().numpy()
+
+    if ring is not None:
+        # Zero-copy ring path: Rust passes a slot index + row count; the net runs
+        # in place on the slot's pinned bf16 input and writes bf16 outputs into
+        # the slot's pinned buffers. The scatter thread calls sync_slot before
+        # reading them (replaces the implicit .cpu() sync).
+        @torch.no_grad()
+        def forward(slot_idx, m):
+            maybe_reload()
+            return ring.run(state["net"], slot_idx, m)
+
+        def sync_slot(slot_idx):
+            ring.sync(slot_idx)
+    else:
+        # Legacy numpy path (CPU / bf16-off / routing test): one f32 batch in,
+        # (logits, values) f32 numpy out. Unchanged contract.
+        @torch.no_grad()
+        def forward(batch):
+            maybe_reload()
+            if batch.shape[0] != bucket_size and not state["warned_shape"]:
+                state["warned_shape"] = True
+                print(f"rust_pipeline: forward batch={batch.shape[0]} != "
+                      f"bucket={bucket_size}; torch.compile may recompile",
+                      flush=True)
+            x = torch.from_numpy(np.ascontiguousarray(batch)).to(device)
+            if BF16:
+                x = x.bfloat16()
+            logits, values = state["net"](x)
+            return logits.float().cpu().numpy(), values.float().cpu().numpy()
+
+        sync_slot = None
 
     def submit_game(rows):
         # `rows` is one finished game's [(state, pi, z), ...]. Same trainer
@@ -270,4 +301,9 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
         return stop_event.is_set() or os.getppid() == 1
 
     engine = chess_rs.PipelineEngine(sims, seed, True, n_threads, bucket_size)
-    engine.run(forward, submit_game, should_stop)
+    if ring is not None:
+        engine.run(forward, submit_game, should_stop, sync_slot,
+                   ring.input_ptrs, ring.logit_ptrs, ring.value_ptrs,
+                   N_SLOTS, ring.in_stride, ring.logit_stride)
+    else:
+        engine.run(forward, submit_game, should_stop)

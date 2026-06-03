@@ -41,6 +41,15 @@ export CHESS_COMPILE="${CHESS_COMPILE:-1}"
 # rollback with `CHESS_BF16=0 pm2 restart chess-train --update-env`.
 export CHESS_BF16="${CHESS_BF16:-1}"
 
+# Zero-copy host I/O ring (rust_pipeline, GB10/ATS): Rust writes bf16 inputs and
+# reads bf16 outputs from pinned host slots the GPU accesses IN PLACE via ATS,
+# eliminating the per-forward H2D and the blocking D2H. Measured ~+10% completed
+# games/sec steady-state on top of compile+bf16 (matches the ~13% forward-time
+# cut from the micro-benchmark). Needs CUDA + bf16. Default ON; rollback with
+# `CHESS_ZEROCOPY=0 pm2 restart chess-train --update-env` (falls back to the
+# legacy numpy forward path).
+export CHESS_ZEROCOPY="${CHESS_ZEROCOPY:-1}"
+
 # Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
 # in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
 # decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).

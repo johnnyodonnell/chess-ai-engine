@@ -48,10 +48,11 @@ use numpy::ndarray::{Array1, Array3, Array4};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use half::bf16;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -166,6 +167,34 @@ struct BucketState {
     ready: Option<Bucket>,  // a full bucket waiting for the consumer (2nd buffer)
 }
 
+// --- zero-copy host I/O ring (GB10/ATS) --------------------------------------
+// When `Shared.ring` is Some, the pipeline runs the ZERO-COPY path instead of
+// the numpy buckets above: workers write encoded leaves (as bf16) DIRECTLY into
+// a slot's pinned host input buffer that the GPU reads in place via ATS; the net
+// writes bf16 outputs into the slot's pinned output buffers; the scatter thread
+// reads them after the slot's CUDA event. Buffers are owned by Python
+// (zerocopy.py); here we hold only the raw host pointers (as usize -> Send+Sync,
+// cast at use sites). A slot is in use from the moment a worker starts filling
+// it until the scatter thread has finished reading its outputs, at which point it
+// returns to `free_slots` (this is the event-gated reuse guarantee: a slot is
+// never re-filled while its outputs are still being read or its forward is live).
+struct HostRing {
+    input: Vec<usize>,   // n raw ptrs to pinned bf16 [B, in_stride]
+    logit: Vec<usize>,   // n raw ptrs to pinned bf16 [B, POLICY_SIZE]
+    value: Vec<usize>,   // n raw ptrs to pinned bf16 [B]
+    in_stride: usize,    // ENC_LEN (1152); logit row stride is POLICY_SIZE
+}
+
+struct RingBucket {
+    slot: usize,
+    games: Vec<Box<InFlight>>, // row r's game travels WITH the slot (positional)
+}
+
+struct RingState {
+    active: RingBucket,           // workers fill this slot's input buffer
+    ready: VecDeque<RingBucket>,  // full buckets waiting for the consumer
+}
+
 struct Config {
     sims: usize,
     add_root_noise: bool,
@@ -181,6 +210,13 @@ struct Shared {
     stop: AtomicBool,
     id_counter: AtomicU64,
     config: Config,
+    // zero-copy ring (Some => ring path; legacy bucket fields above unused)
+    ring: Option<HostRing>,
+    ring_state: Mutex<RingState>,
+    ring_consumer_cv: Condvar,        // consumer waits here for a ready slot
+    free_slots: Mutex<Vec<usize>>,    // slots not currently in use
+    slot_cv: Condvar,                 // workers wait here for a free slot
+    sync_slot: Option<PyObject>,      // Python ring.sync(slot): waits the slot event
 }
 
 // --- per-game helpers (mirror MctsEngine/async_mcts, but standalone so the
@@ -355,6 +391,105 @@ fn push_to_bucket(shared: &Shared, g: Box<InFlight>) {
     }
 }
 
+// --- zero-copy ring worker path ---------------------------------------------
+/// Write one game's encoded leaf (f32 `enc`) into slot `slot`'s pinned host input
+/// buffer at `row`, converting to bf16 in place. SAFETY: callers hold the
+/// `ring_state` lock, so `slot` is the active slot and only one worker writes a
+/// given (slot,row) at a time; the GPU does not read this slot until it is full
+/// and handed to the consumer.
+fn write_input_row(ring: &HostRing, slot: usize, row: usize, enc: &[f32]) {
+    debug_assert_eq!(enc.len(), ring.in_stride);
+    let dst = ring.input[slot] as *mut u16;
+    unsafe {
+        let base = dst.add(row * ring.in_stride);
+        for (i, &x) in enc.iter().enumerate() {
+            *base.add(i) = bf16::from_f32(x).to_bits();
+        }
+    }
+}
+
+/// Pop a free slot, blocking on `slot_cv` until one is available. Returns None on
+/// shutdown. MUST be called WITHOUT holding `ring_state` (deadlock-safe): the
+/// consumer needs `ring_state` to drain `ready`, which lets scatter free a slot.
+fn pop_free_slot_blocking(shared: &Shared) -> Option<usize> {
+    let mut fs = shared.free_slots.lock().unwrap();
+    loop {
+        if let Some(s) = fs.pop() {
+            return Some(s);
+        }
+        if shared.stop.load(AtomicOrdering::Relaxed) {
+            return None;
+        }
+        fs = shared.slot_cv.wait(fs).unwrap();
+    }
+}
+
+/// Ring analogue of `push_to_bucket`: append `g` to the active slot, rotating to a
+/// fresh slot when the active one fills. Backpressure is "no free slot" (workers
+/// block in `pop_free_slot_blocking`, never while holding `ring_state`).
+fn push_ring(shared: &Shared, g: Box<InFlight>) {
+    let b = shared.config.bucket_size;
+    let ring = shared.ring.as_ref().unwrap();
+    let mut g = Some(g);
+    loop {
+        if shared.stop.load(AtomicOrdering::Relaxed) {
+            return; // drop g
+        }
+        let mut rs = shared.ring_state.lock().unwrap();
+        if shared.stop.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        if rs.active.games.len() < b {
+            let slot = rs.active.slot;
+            let row = rs.active.games.len();
+            let gg = g.take().unwrap();
+            write_input_row(ring, slot, row, &gg.staged_enc);
+            rs.active.games.push(gg);
+            if rs.active.games.len() == b {
+                // active full: rotate to ready + start a new active on a fresh
+                // slot. Try non-blocking first (don't block holding ring_state).
+                let ns = shared.free_slots.lock().unwrap().pop();
+                if let Some(ns) = ns {
+                    let full = std::mem::replace(
+                        &mut rs.active,
+                        RingBucket { slot: ns, games: Vec::with_capacity(b) });
+                    rs.ready.push_back(full);
+                    shared.ring_consumer_cv.notify_one();
+                }
+                // else: no free slot now; leave active full (unflushed). The next
+                // push lands in the active-full branch below and flushes after
+                // blocking for a slot OUTSIDE this lock. The consumer keeps
+                // draining `ready` meanwhile, so a slot will free up.
+            }
+            return;
+        }
+        // active is full and was not rotated (no free slot earlier). Flush it now:
+        // acquire a slot WITHOUT holding ring_state, then rotate.
+        drop(rs);
+        let ns = match pop_free_slot_blocking(shared) {
+            Some(s) => s,
+            None => return, // shutting down
+        };
+        {
+            let mut rs = shared.ring_state.lock().unwrap();
+            if rs.active.games.len() == b {
+                let full = std::mem::replace(
+                    &mut rs.active,
+                    RingBucket { slot: ns, games: Vec::with_capacity(b) });
+                rs.ready.push_back(full);
+                shared.ring_consumer_cv.notify_one();
+                // active now empty; loop to append g
+            } else {
+                // another worker already rotated; return our slot and retry
+                let mut fs = shared.free_slots.lock().unwrap();
+                fs.push(ns);
+                shared.slot_cv.notify_one();
+            }
+        }
+        // loop continues; g still Some
+    }
+}
+
 /// Hand a finished game's rows to the Python `submit_game(rows)` callback.
 fn submit_completed(submit_game: &PyObject, rows: Vec<Row>) {
     if rows.is_empty() {
@@ -402,16 +537,27 @@ fn worker_loop(shared: Arc<Shared>, submit_game: PyObject) {
 
         // (C) advance the FSM until it produces one eval or completes.
         match advance_until_eval_or_done(&mut g, &shared.config) {
-            Advance::Eval => push_to_bucket(&shared, g),
+            Advance::Eval => {
+                if shared.ring.is_some() {
+                    push_ring(&shared, g);
+                } else {
+                    push_to_bucket(&shared, g);
+                }
+            }
             Advance::Done(rows) => submit_completed(&submit_game, rows),
         }
     }
 }
 
-/// Handoff from the consumer to the scatter thread: the raw Python `forward`
-/// result (logits[m,POLICY] + values[m] numpy, held as a Py object — `Send`,
-/// needs the GIL only to read) and the m games it belongs to, positionally.
-type ScatterMsg = (PyObject, Vec<Box<InFlight>>);
+/// Handoff from the consumer to the scatter thread, positionally tied to its m
+/// games. Legacy: the raw Python `forward` result (logits[m,POLICY] + values[m]
+/// numpy, held as a Py object — `Send`, needs the GIL only to read). Ring: the
+/// slot index whose pinned bf16 output buffers hold the result (read after the
+/// slot's CUDA event via `sync_slot`).
+enum ScatterMsg {
+    Numpy(PyObject, Vec<Box<InFlight>>),
+    Slot(usize, Vec<Box<InFlight>>),
+}
 
 /// Scatter thread: OFF the consumer's GPU-launch path. Copy the forward output
 /// out of numpy ONCE into an `Arc<Vec<f32>>` (under the GIL — numpy can't outlive
@@ -420,54 +566,107 @@ type ScatterMsg = (PyObject, Vec<Box<InFlight>>);
 /// not the ~1.3 ms of memcpy it used to be — so workers no longer stall on it and
 /// the consumer's next forward overlaps this copy (PyTorch frees the GIL during
 /// CUDA compute). Workers slice their own row lazily in `apply_result`.
+/// Re-queue each scattered game with a cheap `Arc::clone` of the shared policy +
+/// its row index/value. Queue lock held only for the clones+pushes (microseconds).
+/// Workers slice their own row lazily in `apply_result`.
+fn requeue_scattered(
+    shared: &Shared,
+    logits: Arc<Vec<f32>>,
+    values: &[f32],
+    games: Vec<Box<InFlight>>,
+) {
+    let mut q = shared.queue.lock().unwrap();
+    for (r, mut g) in games.into_iter().enumerate() {
+        g.pending = Some(EvalResult {
+            logits: Arc::clone(&logits),
+            row: r,
+            value: values[r],
+        });
+        let key = g.game.history.len() as u64;
+        let seq = g.id;
+        q.push(Queued { key, seq, item: g });
+    }
+}
+
 fn scatter_loop(shared: Arc<Shared>, rx: Receiver<ScatterMsg>) {
     // Exits when the consumer drops the sender (recv -> Err) — i.e. on shutdown.
-    while let Ok((result, games)) = rx.recv() {
-        // Hold the GIL only to validate the arrays and grab their raw buffer
-        // pointers (microseconds). The big memcpy then runs with the GIL RELEASED,
-        // so it overlaps the consumer's NEXT forward (which holds the GIL) — this
-        // is what actually closes the GPU-idle gap. Relocating a GIL-HELD copy to
-        // this thread (the prior version) did not, since one thread holds the GIL.
-        let ptrs = Python::with_gil(|py| -> PyResult<(*const f32, usize, *const f32, usize)> {
-            let bound = result.bind(py);
-            let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
-                bound.extract()?;
-            let l = logits.as_slice()?; // validates C-contiguity
-            let v = values.as_slice()?;
-            Ok((l.as_ptr(), l.len(), v.as_ptr(), v.len()))
-        });
-        let (lptr, llen, vptr, vlen) = match ptrs {
-            Ok(p) => p,
-            Err(e) => {
-                // `forward` returned an unexpected shape/type. Fail the run rather
-                // than silently mis-route corrupted targets into training.
-                Python::with_gil(|py| e.print(py));
-                shared.stop.store(true, AtomicOrdering::Relaxed);
-                shared.bucket_cv_worker.notify_all();
-                shared.bucket_cv_consumer.notify_all();
-                return;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            // --- legacy numpy path ---
+            ScatterMsg::Numpy(result, games) => {
+                // Hold the GIL only to validate the arrays and grab raw buffer
+                // pointers (microseconds); the big memcpy then runs GIL-RELEASED,
+                // overlapping the consumer's next forward.
+                let ptrs =
+                    Python::with_gil(|py| -> PyResult<(*const f32, usize, *const f32, usize)> {
+                        let bound = result.bind(py);
+                        let (logits, values): (PyReadonlyArray2<f32>, PyReadonlyArray1<f32>) =
+                            bound.extract()?;
+                        let l = logits.as_slice()?; // validates C-contiguity
+                        let v = values.as_slice()?;
+                        Ok((l.as_ptr(), l.len(), v.as_ptr(), v.len()))
+                    });
+                let (lptr, llen, vptr, vlen) = match ptrs {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Unexpected shape/type: fail the run rather than silently
+                        // mis-route corrupted targets into training.
+                        Python::with_gil(|py| e.print(py));
+                        shared.stop.store(true, AtomicOrdering::Relaxed);
+                        shared.bucket_cv_worker.notify_all();
+                        shared.bucket_cv_consumer.notify_all();
+                        return;
+                    }
+                };
+                // SAFETY: `result` (dropped below) keeps the numpy arrays + buffers
+                // alive; numpy never relocates a buffer and nothing mutates these
+                // fresh arrays. GIL released here -> overlaps the next forward.
+                let logits_flat = unsafe { std::slice::from_raw_parts(lptr, llen) }.to_vec();
+                let values_flat = unsafe { std::slice::from_raw_parts(vptr, vlen) }.to_vec();
+                Python::with_gil(|_py| drop(result));
+                requeue_scattered(&shared, Arc::new(logits_flat), &values_flat, games);
             }
-        };
-        // SAFETY: `result` (dropped below, after the copy) keeps both numpy arrays
-        // and their data buffers alive; numpy never relocates an array's buffer,
-        // and nothing mutates these freshly-produced arrays. GIL is released here,
-        // so this runs concurrently with the consumer's next GIL-held forward.
-        let logits_flat = unsafe { std::slice::from_raw_parts(lptr, llen) }.to_vec();
-        let values_flat = unsafe { std::slice::from_raw_parts(vptr, vlen) }.to_vec();
-        // Done reading numpy; drop the Py result (the decref needs the GIL).
-        Python::with_gil(|_py| drop(result));
-
-        let logits = Arc::new(logits_flat);
-        let mut q = shared.queue.lock().unwrap();
-        for (r, mut g) in games.into_iter().enumerate() {
-            g.pending = Some(EvalResult {
-                logits: Arc::clone(&logits),
-                row: r,
-                value: values_flat[r],
-            });
-            let key = g.game.history.len() as u64;
-            let seq = g.id;
-            q.push(Queued { key, seq, item: g });
+            // --- zero-copy ring path ---
+            ScatterMsg::Slot(slot, games) => {
+                // Wait the slot's CUDA event (GIL released inside torch) before
+                // reading its pinned output buffers. Replaces the implicit .cpu()
+                // sync. SAFETY for the reads below: after this returns, the GPU has
+                // finished writing this slot's outputs, and the slot will not be
+                // re-filled until we return it to free_slots at the end.
+                let sync = shared.sync_slot.as_ref().unwrap();
+                let synced = Python::with_gil(|py| -> PyResult<()> {
+                    sync.call1(py, (slot,))?;
+                    Ok(())
+                });
+                if let Err(e) = synced {
+                    Python::with_gil(|py| e.print(py));
+                    shared.stop.store(true, AtomicOrdering::Relaxed);
+                    shared.ring_consumer_cv.notify_all();
+                    shared.slot_cv.notify_all();
+                    return;
+                }
+                let ring = shared.ring.as_ref().unwrap();
+                let m = games.len();
+                let lbase = ring.logit[slot] as *const u16;
+                let vbase = ring.value[slot] as *const u16;
+                let mut logits_flat = Vec::with_capacity(m * POLICY_SIZE);
+                let mut values_flat = Vec::with_capacity(m);
+                // bf16 -> f32 (the net ran bf16, so this loses nothing the f32 path
+                // had). Off the consumer's GPU-launch path, overlaps next forward.
+                unsafe {
+                    for i in 0..m * POLICY_SIZE {
+                        logits_flat.push(bf16::from_bits(*lbase.add(i)).to_f32());
+                    }
+                    for r in 0..m {
+                        values_flat.push(bf16::from_bits(*vbase.add(r)).to_f32());
+                    }
+                }
+                requeue_scattered(&shared, Arc::new(logits_flat), &values_flat, games);
+                // Return the slot AFTER its outputs are fully read (event-gated
+                // reuse: a slot is never re-filled while still in use).
+                shared.free_slots.lock().unwrap().push(slot);
+                shared.slot_cv.notify_one();
+            }
         }
     }
 }
@@ -476,12 +675,68 @@ fn scatter_loop(shared: Arc<Shared>, rx: Receiver<ScatterMsg>) {
 /// `forward` back-to-back, and hand the raw result to the scatter thread (which
 /// copies it out + re-queues). Polls `stop` (with a bounded wait so it still polls
 /// when no bucket ever fills — flush-on-size-only is preserved).
+/// Consumer for the zero-copy ring: take a ready slot, call `forward(slot, m)`
+/// (runs the net in place on the slot's pinned input, writes bf16 outputs into
+/// its pinned output buffers, records the slot's event), and hand the slot to
+/// scatter. No numpy, no result copy on this thread.
+fn consumer_ring(
+    shared: Arc<Shared>,
+    forward: PyObject,
+    stop: PyObject,
+    scatter_tx: SyncSender<ScatterMsg>,
+) -> PyResult<()> {
+    loop {
+        // (A) acquire a ready slot, polling stop() while idle.
+        let rb = loop {
+            {
+                let rs = shared.ring_state.lock().unwrap();
+                if shared.stop.load(AtomicOrdering::Relaxed) {
+                    return Ok(());
+                }
+                let mut rs = rs;
+                if let Some(rb) = rs.ready.pop_front() {
+                    break rb;
+                }
+                let _ = shared
+                    .ring_consumer_cv
+                    .wait_timeout(rs, Duration::from_millis(250))
+                    .unwrap();
+            }
+            if shared.stop.load(AtomicOrdering::Relaxed) {
+                return Ok(());
+            }
+            if poll_stop(&shared, &stop)? {
+                return Ok(());
+            }
+        };
+        // (B) forward(slot, m) under the GIL.
+        let RingBucket { slot, games } = rb;
+        let m = games.len();
+        Python::with_gil(|py| -> PyResult<()> {
+            forward.call1(py, (slot, m))?;
+            Ok(())
+        })?;
+        // (C) hand slot + games to scatter; loop straight into the next forward.
+        if scatter_tx.send(ScatterMsg::Slot(slot, games)).is_err() {
+            shared.stop.store(true, AtomicOrdering::Relaxed);
+            return Ok(());
+        }
+        // (D) poll stop after the forward.
+        if poll_stop(&shared, &stop)? {
+            return Ok(());
+        }
+    }
+}
+
 fn consumer_loop(
     shared: Arc<Shared>,
     forward: PyObject,
     stop: PyObject,
     scatter_tx: SyncSender<ScatterMsg>,
 ) -> PyResult<()> {
+    if shared.ring.is_some() {
+        return consumer_ring(shared, forward, stop, scatter_tx);
+    }
     loop {
         // (A) acquire a full bucket, polling stop() while idle.
         let bucket = loop {
@@ -522,7 +777,7 @@ fn consumer_loop(
         // (C) hand the result + its games to the scatter thread and loop straight
         // back into the next forward. Bounded channel -> backpressure if scatter
         // falls behind. A send error means scatter has exited (shutdown).
-        if scatter_tx.send((result, games)).is_err() {
+        if scatter_tx.send(ScatterMsg::Numpy(result, games)).is_err() {
             shared.stop.store(true, AtomicOrdering::Relaxed);
             return Ok(());
         }
@@ -575,15 +830,48 @@ impl PipelineEngine {
     /// finished game's list of (state[18,8,8], pi[4672], z) tuples. `stop() -> bool`
     /// ends the run (orphan/shutdown checks live there). In-flight games are
     /// dropped on shutdown (no drain).
+    /// Ring params (zero-copy path) are optional: passing `input_ptrs` (one pinned
+    /// host bf16 input buffer per slot) + `logit_ptrs`/`value_ptrs` + `sync_slot`
+    /// switches `forward` to the `forward(slot_idx, m)` contract. Omit them (the
+    /// routing test does) to keep the legacy `forward(batch)->(logits,values)` path.
+    #[pyo3(signature = (forward, submit_game, stop, sync_slot=None,
+                        input_ptrs=Vec::new(), logit_ptrs=Vec::new(),
+                        value_ptrs=Vec::new(), n_slots=0, in_stride=0,
+                        logit_stride=0))]
     fn run(
         &mut self,
         py: Python<'_>,
         forward: PyObject,
         submit_game: PyObject,
         stop: PyObject,
+        sync_slot: Option<PyObject>,
+        input_ptrs: Vec<usize>,
+        logit_ptrs: Vec<usize>,
+        value_ptrs: Vec<usize>,
+        n_slots: usize,
+        in_stride: usize,
+        logit_stride: usize,
     ) -> PyResult<()> {
         let n_threads = self.n_threads.max(1);
         let bucket_size = self.bucket_size.max(1);
+        let ring = if !input_ptrs.is_empty() {
+            // scatter reads logit rows with POLICY_SIZE stride (matches apply_result)
+            assert_eq!(logit_stride, POLICY_SIZE, "ring logit stride must == POLICY_SIZE");
+            Some(HostRing {
+                input: input_ptrs,
+                logit: logit_ptrs,
+                value: value_ptrs,
+                in_stride,
+            })
+        } else {
+            None
+        };
+        // Ring free-list: slot 0 is bound to the initial active bucket; 1..n free.
+        let free_init: Vec<usize> = if ring.is_some() {
+            (1..n_slots).collect()
+        } else {
+            Vec::new()
+        };
         let shared = Arc::new(Shared {
             queue: Mutex::new(BinaryHeap::new()),
             buckets: Mutex::new(BucketState {
@@ -600,6 +888,18 @@ impl PipelineEngine {
                 bucket_size,
                 seed: self.seed,
             },
+            ring,
+            ring_state: Mutex::new(RingState {
+                active: RingBucket {
+                    slot: 0,
+                    games: Vec::with_capacity(bucket_size),
+                },
+                ready: VecDeque::new(),
+            }),
+            ring_consumer_cv: Condvar::new(),
+            free_slots: Mutex::new(free_init),
+            slot_cv: Condvar::new(),
+            sync_slot,
         });
 
         // Clone the submit_game callable per worker while we still hold the GIL.
@@ -629,6 +929,8 @@ impl PipelineEngine {
             shared.stop.store(true, AtomicOrdering::Relaxed);
             shared.bucket_cv_worker.notify_all();
             shared.bucket_cv_consumer.notify_all();
+            shared.ring_consumer_cv.notify_all();
+            shared.slot_cv.notify_all();
             for h in handles {
                 let _ = h.join();
             }
