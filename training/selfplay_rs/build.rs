@@ -56,4 +56,13 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", torch_lib.trim());
     println!("cargo:rustc-link-lib=dylib=c10_cuda");
     println!("cargo:rustc-link-lib=dylib=torch_cuda");
+
+    // The shim calls cudaEvent* directly -> needs libcudart on the link line.
+    // It ships as libcudart.so.12 (no unversioned symlink), so link by exact name.
+    let cudart_dir = py_out(
+        "import os, nvidia.cuda_runtime as r; print(os.path.join(os.path.dirname(r.__file__), 'lib'))",
+    );
+    println!("cargo:rustc-link-search=native={}", cudart_dir.trim());
+    println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+    println!("cargo:rustc-link-arg=-l:libcudart.so.12");
 }

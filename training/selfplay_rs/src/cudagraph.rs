@@ -15,6 +15,34 @@ extern "C" {
     fn cg_set_side_stream();
     fn cg_device_synchronize();
     fn cg_set_cudnn_benchmark(on: bool);
+    fn cg_event_new() -> *mut c_void;
+    fn cg_event_record(e: *mut c_void);
+    fn cg_event_sync(e: *mut c_void);
+    fn cg_event_free(e: *mut c_void);
+}
+
+/// A CUDA event recorded on the current stream; another thread can `sync` it to
+/// wait for that stream work (the forward + output copy) to finish.
+pub struct CudaEvent {
+    raw: *mut c_void,
+}
+// Recorded on one thread, waited on another (the scatter thread).
+unsafe impl Send for CudaEvent {}
+impl CudaEvent {
+    pub fn new() -> CudaEvent {
+        CudaEvent { raw: unsafe { cg_event_new() } }
+    }
+    pub fn record(&self) {
+        unsafe { cg_event_record(self.raw) }
+    }
+    pub fn sync(&self) {
+        unsafe { cg_event_sync(self.raw) }
+    }
+}
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        unsafe { cg_event_free(self.raw) }
+    }
 }
 
 /// Enable cuDNN benchmark autotuning (fast conv algos baked in during warmup).

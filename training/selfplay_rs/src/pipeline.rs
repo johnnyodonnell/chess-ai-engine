@@ -21,8 +21,9 @@
 //! fresh weights with no recapture.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +38,10 @@ use rand::SeedableRng;
 use tch::{Device, Kind, Tensor};
 
 use crate::aoti::AotiModel;
+use crate::cudagraph::{self, CudaEvent};
+
+/// In-flight forwards (= pinned input slots = max GPU forwards queued ahead).
+const N_SLOTS: usize = 4;
 
 pub type Row = (Vec<f32>, Vec<f32>, f32); // (state[1152], pi[4672], z)
 
@@ -360,7 +365,7 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
     }
 }
 
-// --- inference thread --------------------------------------------------------
+// --- inference + scatter (overlapped) ---------------------------------------
 /// bf16 CUDA tensor -> Vec<f32> on host. D2H is bf16 (half the bytes of an f32
 /// upcast-then-copy); the bf16->f32 widening happens on the CPU.
 fn bf16_to_vec_f32(t: &Tensor) -> Vec<f32> {
@@ -371,32 +376,44 @@ fn bf16_to_vec_f32(t: &Tensor) -> Vec<f32> {
     v
 }
 
+/// One in-flight forward handed from the inference thread to the scatter thread.
+/// Owns its device tensors (Tensor is Send); the scatter thread reads the outputs
+/// after `event` and recycles the pinned-input `slot`.
+struct WorkItem {
+    slot: usize,
+    m: usize,
+    _x_dev: Tensor, // kept alive until the forward (event) completes
+    out_logits: Tensor,
+    out_values: Tensor,
+    event: CudaEvent,
+    games: Vec<Box<InFlight>>,
+}
+
+/// Owns the model + a pool of pinned input buffers. The inference thread fills a
+/// pinned slot, async-copies it to the device, launches the fused AOTI forward,
+/// and records an event — all non-blocking, so forwards queue back-to-back.
 struct Infer {
     model: AotiModel,
     dev: Device,
-    b: usize,
-    in_dev: Tensor,     // [B,18,8,8] bf16 (static input the .pt2 reads)
-    out_logits: Tensor, // [B,4672] bf16 (AOTI output target)
-    out_values: Tensor, // [B] bf16
-    model_path: String, // serving_model.pt2
+    pinned_in: Vec<Tensor>, // N pinned host bf16 [B,18,8,8]
+    model_path: String,
     reload_every: Duration,
     last_check: Instant,
     last_mtime: Option<std::time::SystemTime>,
 }
 
 impl Infer {
-    fn new(config: &Config) -> Infer {
+    fn new(config: &Config, n_slots: usize) -> Infer {
         let dev = Device::Cuda(0);
-        let b = config.bucket_size;
+        let b = config.bucket_size as i64;
         let model = AotiModel::load(&config.model_path);
-        let opts = (Kind::BFloat16, dev);
+        let pinned_in = (0..n_slots)
+            .map(|_| Tensor::zeros([b, 18, 8, 8], (Kind::BFloat16, Device::Cpu)).pin_memory(dev))
+            .collect();
         Infer {
             model,
             dev,
-            b,
-            in_dev: Tensor::zeros([b as i64, 18, 8, 8], opts),
-            out_logits: Tensor::zeros([b as i64, POLICY_SIZE as i64], opts),
-            out_values: Tensor::zeros([b as i64], opts),
+            pinned_in,
             last_mtime: std::fs::metadata(&config.model_path).and_then(|m| m.modified()).ok(),
             model_path: config.model_path.clone(),
             reload_every: config.reload_every,
@@ -412,37 +429,44 @@ impl Infer {
         let m = std::fs::metadata(&self.model_path).and_then(|md| md.modified()).ok();
         if m.is_some() && m != self.last_mtime {
             // Trainer recompiled the .pt2 with fresh weights: drop the old loader,
-            // load the new package (~ms). No graph to recapture.
+            // load the new package (~ms). No graph state to invalidate.
             self.model = AotiModel::load(&self.model_path);
             self.last_mtime = m;
         }
     }
 
-    /// Run the fused AOTI forward on a bucket of `m` encoded rows; return the full
-    /// policy [m*POLICY_SIZE] + values [m]. The .pt2 is compiled for fixed B; a
-    /// partial batch (startup/shutdown) fills the first m rows and ignores the rest.
-    fn infer(&mut self, enc: &[f32], m: usize) -> (Arc<Vec<f32>>, Vec<f32>) {
-        self.maybe_reload();
-        let host = Tensor::from_slice(enc).reshape([m as i64, 18, 8, 8]);
-        let x = host.to_device(self.dev).to_kind(Kind::BFloat16);
-        // Fill the first m rows of the static input (the .pt2 always runs B rows).
-        self.in_dev.narrow(0, 0, m as i64).copy_(&x);
-        self.model.run(&self.in_dev, &self.out_logits, &self.out_values);
-        let logits = Arc::new(bf16_to_vec_f32(&self.out_logits.narrow(0, 0, m as i64)));
-        let values = bf16_to_vec_f32(&self.out_values.narrow(0, 0, m as i64));
-        (logits, values)
+    /// Fill pinned slot `slot` with `m` rows, async-H2D, launch the forward, and
+    /// record a completion event. Returns owned device tensors + event (all async
+    /// — the CPU does not block on the GPU here).
+    fn launch(&mut self, slot: usize, enc: &[f32], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
+        let src = Tensor::from_slice(enc).reshape([m as i64, 18, 8, 8]); // CPU f32
+        self.pinned_in[slot].narrow(0, 0, m as i64).copy_(&src); // f32 -> bf16 into pinned
+        // async H2D from pinned memory (does not block the CPU).
+        let x = self.pinned_in[slot].internal_to_copy((Kind::BFloat16, self.dev), true);
+        let opts = (Kind::BFloat16, self.dev);
+        let b = self.pinned_in[slot].size()[0];
+        let out_logits = Tensor::zeros([b, POLICY_SIZE as i64], opts);
+        let out_values = Tensor::zeros([b], opts);
+        self.model.run(&x, &out_logits, &out_values); // async on the current stream
+        let event = CudaEvent::new();
+        event.record();
+        (x, out_logits, out_values, event)
     }
 }
 
-fn inference_loop(shared: Arc<Shared>) {
-    let mut infer = Infer::new(&shared.config);
+/// Producer: pull full buckets, launch forwards back-to-back into free slots, and
+/// hand each to the scatter thread. Blocks only when all N slots are in flight.
+fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>, free_rx: Receiver<usize>) {
+    cudagraph::set_side_stream(); // a non-default stream for all inference ops
+    let mut infer = Infer::new(&shared.config, N_SLOTS);
     loop {
         // acquire a full bucket, polling stop while idle.
         let bucket = loop {
-            let mut bs = shared.buckets.lock().unwrap();
+            let bs = shared.buckets.lock().unwrap();
             if shared.stop.load(AtomicOrdering::Relaxed) {
                 return;
             }
+            let mut bs = bs;
             if let Some(b) = bs.ready.take() {
                 shared.cv_worker.notify_all();
                 break b;
@@ -452,10 +476,34 @@ fn inference_loop(shared: Arc<Shared>) {
                 return;
             }
         };
+        infer.maybe_reload();
+        let slot = match free_rx.recv() {
+            Ok(s) => s,
+            Err(_) => return, // scatter gone
+        };
         let Bucket { enc, games } = bucket;
         let m = games.len();
-        let (logits, values) = infer.infer(&enc, m);
-        requeue_scattered(&shared, logits, &values, games);
+        let (x, out_logits, out_values, event) = infer.launch(slot, &enc, m);
+        let item = WorkItem { slot, m, _x_dev: x, out_logits, out_values, event, games };
+        if work_tx.send(item).is_err() {
+            return;
+        }
+    }
+}
+
+/// Consumer: wait each forward's event, read its bf16 outputs (D2H), requeue the
+/// games, and recycle the pinned slot. Overlaps the inference thread's next forward.
+fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>, free_tx: SyncSender<usize>) {
+    while let Ok(item) = work_rx.recv() {
+        item.event.sync(); // wait the forward + output copy
+        let m = item.m as i64;
+        let logits = Arc::new(bf16_to_vec_f32(&item.out_logits.narrow(0, 0, m)));
+        let values = bf16_to_vec_f32(&item.out_values.narrow(0, 0, m));
+        requeue_scattered(&shared, logits, &values, item.games);
+        if free_tx.send(item.slot).is_err() {
+            return;
+        }
+        // item's device tensors + event drop here (after the readback).
     }
 }
 
@@ -477,10 +525,13 @@ fn make_shared(config: Config) -> Arc<Shared> {
     })
 }
 
-fn spawn_pipeline(
-    shared: Arc<Shared>,
-    sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>,
-) -> (Vec<thread::JoinHandle<()>>, thread::JoinHandle<()>) {
+struct Pipeline {
+    workers: Vec<thread::JoinHandle<()>>,
+    infer: thread::JoinHandle<()>,
+    scatter: thread::JoinHandle<()>,
+}
+
+fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) -> Pipeline {
     let n_threads = shared.config.n_threads.max(1);
     let mut workers = Vec::with_capacity(n_threads);
     for _ in 0..n_threads {
@@ -488,19 +539,33 @@ fn spawn_pipeline(
         let sk = sink.clone();
         workers.push(thread::spawn(move || worker_loop(sh, sk)));
     }
-    let sh = shared.clone();
-    let infer = thread::spawn(move || inference_loop(sh));
-    (workers, infer)
+    let (work_tx, work_rx) = sync_channel::<WorkItem>(N_SLOTS);
+    let (free_tx, free_rx) = sync_channel::<usize>(N_SLOTS);
+    for i in 0..N_SLOTS {
+        free_tx.send(i).unwrap();
+    }
+    let infer = {
+        let sh = shared.clone();
+        thread::spawn(move || inference_thread(sh, work_tx, free_rx))
+    };
+    let scatter = {
+        let sh = shared.clone();
+        thread::spawn(move || scatter_thread(sh, work_rx, free_tx))
+    };
+    Pipeline { workers, infer, scatter }
 }
 
-fn shutdown(shared: &Shared, workers: Vec<thread::JoinHandle<()>>, infer: thread::JoinHandle<()>) {
+fn shutdown(shared: &Shared, p: Pipeline) {
     shared.stop.store(true, AtomicOrdering::Relaxed);
     shared.cv_worker.notify_all();
     shared.cv_infer.notify_all();
-    for h in workers {
+    for h in p.workers {
         let _ = h.join();
     }
-    let _ = infer.join();
+    // Inference returns at the bucket-acquire stop-check; dropping its work_tx
+    // ends the scatter thread once its queue drains.
+    let _ = p.infer.join();
+    let _ = p.scatter.join();
 }
 
 /// Bench mode: run for `run` seconds, printing games/sec + avg_plies + rows/sec
@@ -508,7 +573,7 @@ fn shutdown(shared: &Shared, workers: Vec<thread::JoinHandle<()>>, infer: thread
 pub fn run_bench(config: Config, run: Duration, interval: Duration) {
     let shared = make_shared(config);
     let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(|_rows: Vec<Row>| {});
-    let (workers, infer) = spawn_pipeline(shared.clone(), sink);
+    let pipeline = spawn_pipeline(shared.clone(), sink);
 
     let start = Instant::now();
     let mut win_start = start;
@@ -533,6 +598,6 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
             win_start = Instant::now();
         }
     }
-    shutdown(&shared, workers, infer);
+    shutdown(&shared, pipeline);
     println!("DONE (read steady-state from the last few intervals)");
 }

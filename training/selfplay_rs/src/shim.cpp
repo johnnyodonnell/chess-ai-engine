@@ -5,10 +5,30 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+#include <cuda_runtime.h>
 #include <string>
 #include <vector>
 
 extern "C" {
+
+// --- CUDA events: gate the scatter thread's readback on the forward's
+// completion so it overlaps the inference thread's next forward. Recorded on the
+// thread's current CUDA stream.
+void* cg_event_new() {
+    cudaEvent_t e;
+    cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    return reinterpret_cast<void*>(e);
+}
+void cg_event_record(void* e) {
+    cudaEventRecord(reinterpret_cast<cudaEvent_t>(e),
+                    c10::cuda::getCurrentCUDAStream().stream());
+}
+void cg_event_sync(void* e) {
+    cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e));
+}
+void cg_event_free(void* e) {
+    cudaEventDestroy(reinterpret_cast<cudaEvent_t>(e));
+}
 
 // --- AOTInductor package loader (the fused, Python-free forward) -------------
 // tch tensor handles (C_tensor*) ARE at::Tensor* under the hood, so we
