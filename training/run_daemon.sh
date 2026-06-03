@@ -1,83 +1,23 @@
 #!/usr/bin/env bash
-# pm2 entrypoint for indefinite self-play training (parallel orchestrator, Path B).
-# Run from the repo root: pm2 start training/run_daemon.sh --name chess-train \
-#                           --kill-timeout 20000
-# The orchestrator runs ONE in-process native self-play engine (Rust owns the
-# games and does the GPU forward IN-PROCESS — no inference server, no shm) plus
-# the trainer pacing SGD to the data rate. It resumes runs/run1's latest.pt
-# (checkpoint format is shared with the legacy loop.py).
+# pm2 entrypoint for indefinite self-play training.
+#   pm2 start training/run_daemon.sh --name chess-train --kill-timeout 20000
 #
-# Self-play backend (CHESS_BACKEND):
-#   rust_pipeline (default) — decoupled non-blocking pipeline: workers never block
-#     on the GPU; a global ply-priority queue feeds two inference buckets that one
-#     consumer batches; dynamic game count (bucket size is the one batch-width knob).
-#   rust_async — bulk-synchronous multi-threaded engine (the A/B baseline).
-# Switch/rollback: `CHESS_BACKEND=rust_async pm2 restart chess-train --update-env`.
+# The orchestrator runs the trainer (PyTorch, paced SGD) in this process and
+# spawns the standalone Rust self-play worker (selfplay_rs) as a subprocess. The
+# worker runs MCTS + the AOTInductor forward 100% in Rust (no Python in the
+# self-play path) and streams finished games back over stdout. The trainer
+# recompiles serving_model.pt2 every --pt2-every and the worker reloads it.
+# Resumes runs/run1's latest.pt (checkpoint format shared with loop.py).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$REPO_DIR/training/.venv"
 OUT_DIR="$REPO_DIR/runs/run1"
 
-# One-time warm start: set INIT_FROM to a checkpoint to seed a fresh run from
-# existing weights (clean clock/cadence). Ignored once latest.pt exists.
+# One-time warm start: set INIT_FROM to seed a fresh run. Ignored once latest.pt exists.
 INIT_ARGS=()
 if [[ -n "${INIT_FROM:-}" ]]; then
   INIT_ARGS=(--init-from "$INIT_FROM")
-fi
-
-export CHESS_BACKEND="${CHESS_BACKEND:-rust_pipeline}"
-
-# torch.compile the in-process self-play forward (rust_pipeline). The net is tiny
-# (4x96), so eager mode is dominated by per-op dispatch overhead; compile fuses it
-# into a few kernels. Measured +29% completed games/sec on the GB10. Default ON;
-# rollback with `CHESS_COMPILE=0 pm2 restart chess-train --update-env`.
-export CHESS_COMPILE="${CHESS_COMPILE:-1}"
-
-# Run the in-process self-play forward in bfloat16 (rust_pipeline). Pure bf16
-# weights (not autocast) on the tiny 4x96 net; stacks on top of torch.compile.
-# Measured ~1.7x completed games/sec on the GB10, steady-state, with the
-# self-play game distribution unchanged (avg plies converges). Default ON;
-# rollback with `CHESS_BF16=0 pm2 restart chess-train --update-env`.
-export CHESS_BF16="${CHESS_BF16:-1}"
-
-# Zero-copy host I/O ring (rust_pipeline, GB10/ATS): Rust writes bf16 inputs and
-# reads bf16 outputs from pinned host slots the GPU accesses IN PLACE via ATS,
-# eliminating the per-forward H2D and the blocking D2H. Measured ~+10% completed
-# games/sec steady-state on top of compile+bf16 (matches the ~13% forward-time
-# cut from the micro-benchmark). Needs CUDA + bf16. Default ON; rollback with
-# `CHESS_ZEROCOPY=0 pm2 restart chess-train --update-env` (falls back to the
-# legacy numpy forward path).
-export CHESS_ZEROCOPY="${CHESS_ZEROCOPY:-1}"
-
-# CUDA graphs for the ring forward (rust_pipeline). Captures one graph per pinned
-# slot of the COMPILED forward and replays it as a single launch, removing
-# per-kernel launch + dynamo overhead (the net is tiny/launch-bound). Measured
-# ~+9.5% forward-time in isolation. The in-place weight reload is reflected by
-# replay with no recapture (test_cudagraph_reload.py guards this). Needs the ring
-# (CHESS_ZEROCOPY=1). Default ON; rollback with
-# `CHESS_CUDAGRAPH=0 pm2 restart chess-train --update-env`.
-export CHESS_CUDAGRAPH="${CHESS_CUDAGRAPH:-1}"
-
-# Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
-# in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
-# decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).
-ENGINE_ARGS=()
-if [[ "$CHESS_BACKEND" == "rust_pipeline" ]]; then
-  ENGINE_ARGS=(
-    --pipeline-bucket-size "${PIPELINE_BUCKET_SIZE:-512}"
-    --pipeline-n-threads "${PIPELINE_N_THREADS:-16}"
-  )
-elif [[ "$CHESS_BACKEND" == "rust_async" ]]; then
-  ENGINE_ARGS=(
-    --async-n-games "${ASYNC_N_GAMES:-512}"
-    --async-n-threads "${ASYNC_N_THREADS:-18}"
-    --async-max-batch "${ASYNC_MAX_BATCH:-512}"
-  )
-else
-  echo "run_daemon.sh: CHESS_BACKEND must be rust_pipeline or rust_async" \
-       "(got '$CHESS_BACKEND')" >&2
-  exit 1
 fi
 
 cd "$REPO_DIR/training"
@@ -86,7 +26,8 @@ exec "$VENV/bin/python" orchestrator.py \
   --save-latest-every 300s \
   --out-dir "$OUT_DIR" \
   --workers "${WORKERS:-12}" \
-  --games-per-worker "${GAMES_PER_WORKER:-16}" \
   --sims "${SIMS:-200}" \
-  "${ENGINE_ARGS[@]}" \
+  --pipeline-bucket-size "${PIPELINE_BUCKET_SIZE:-512}" \
+  --pipeline-n-threads "${PIPELINE_N_THREADS:-16}" \
+  --pt2-every "${PT2_EVERY:-300s}" \
   "${INIT_ARGS[@]}"

@@ -6,9 +6,7 @@
 //! forward. The pure logic lives in `chess_core`; the 100% Rust self-play worker
 //! is the separate `selfplay` binary. See `[[rust-selfplay-port]]`.
 
-mod async_mcts;
 mod mcts;
-mod pipeline;
 
 use chess_core::board::{pack_move, Board as CoreBoard};
 use numpy::ndarray::{Array3, Array4};
@@ -114,8 +112,6 @@ fn encode_many<'py>(
 fn chess_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBoard>()?;
     m.add_class::<mcts::MctsEngine>()?;
-    m.add_class::<async_mcts::AsyncMctsEngine>()?;
-    m.add_class::<pipeline::PipelineEngine>()?;
     m.add_function(wrap_pyfunction!(encode_many, m)?)?;
     Ok(())
 }

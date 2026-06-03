@@ -22,6 +22,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -600,4 +601,48 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
     }
     shutdown(&shared, pipeline);
     println!("DONE (read steady-state from the last few intervals)");
+}
+
+// --- serve mode (production IPC) ---------------------------------------------
+/// Write `&[f32]` as little-endian bytes (aarch64/x86 are LE; matches numpy
+/// frombuffer('<f4') on the reader side). Contiguous slice -> raw bytes.
+fn write_f32s<W: Write>(w: &mut W, s: &[f32]) -> io::Result<()> {
+    let bytes = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) };
+    w.write_all(bytes)
+}
+
+/// One finished game = one frame: u32 n_rows, then n_rows x (state[1152] f32,
+/// pi[4672] f32, z f32), all little-endian. Flushed per game so the trainer's
+/// reader sees data promptly.
+fn write_frame(out: &Mutex<BufWriter<io::Stdout>>, rows: &[Row]) {
+    let mut w = out.lock().unwrap();
+    let _ = w.write_all(&(rows.len() as u32).to_le_bytes());
+    for (state, pi, z) in rows {
+        let _ = write_f32s(&mut *w, state);
+        let _ = write_f32s(&mut *w, pi);
+        let _ = w.write_all(&z.to_le_bytes());
+    }
+    let _ = w.flush();
+}
+
+/// Serve mode: run the pipeline forever, streaming finished games as framed bytes
+/// on stdout for the orchestrator's reader thread. Stops when the parent closes
+/// our stdin (EOF = orchestrator died) or on SIGTERM (default-kills the process).
+pub fn run_serve(config: Config) {
+    let shared = make_shared(config);
+    let stdout = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let so = stdout.clone();
+    let sink: Arc<dyn Fn(Vec<Row>) + Send + Sync> = Arc::new(move |rows: Vec<Row>| write_frame(&so, &rows));
+    let pipeline = spawn_pipeline(shared.clone(), sink);
+
+    // Block until the orchestrator closes our stdin (its death closes the pipe).
+    let mut buf = [0u8; 256];
+    loop {
+        match io::stdin().read(&mut buf) {
+            Ok(0) | Err(_) => break, // EOF / error -> shut down
+            Ok(_) => {}              // ignore any bytes
+        }
+    }
+    shutdown(&shared, pipeline);
+    let _ = stdout.lock().unwrap().flush();
 }

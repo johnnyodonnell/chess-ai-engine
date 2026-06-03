@@ -250,6 +250,11 @@ fn main() {
             let (config, run, interval) = bench_config(&args);
             pipeline::run_bench(config, run, interval);
         }
+        "serve" => {
+            assert!(tch::Cuda::is_available(), "CUDA not available to tch");
+            let (config, _, _) = bench_config(&args);
+            pipeline::run_serve(config);
+        }
         "time-forward" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let weights = flag(&args, "--weights", "weights.safetensors");
@@ -270,7 +275,7 @@ fn main() {
             std::process::exit(if aoti_parity(&dir, &pt2) { 0 } else { 1 });
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: forward-check | bench");
+            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-time | aoti-parity | time-forward");
             std::process::exit(2);
         }
     }
