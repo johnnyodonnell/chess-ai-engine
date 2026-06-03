@@ -685,6 +685,10 @@ fn consumer_ring(
     stop: PyObject,
     scatter_tx: SyncSender<ScatterMsg>,
 ) -> PyResult<()> {
+    // The post-forward stop() callback (getppid + an Event semaphore acquire) is
+    // throttled to ~100ms so it isn't paid on every forward's hot path; the cheap
+    // `shared.stop` atomic is still checked every iteration in (A).
+    let mut last_poll = std::time::Instant::now();
     loop {
         // (A) acquire a ready slot, polling stop() while idle.
         let rb = loop {
@@ -721,9 +725,12 @@ fn consumer_ring(
             shared.stop.store(true, AtomicOrdering::Relaxed);
             return Ok(());
         }
-        // (D) poll stop after the forward.
-        if poll_stop(&shared, &stop)? {
-            return Ok(());
+        // (D) poll stop after the forward (throttled; see last_poll above).
+        if last_poll.elapsed() >= Duration::from_millis(100) {
+            last_poll = std::time::Instant::now();
+            if poll_stop(&shared, &stop)? {
+                return Ok(());
+            }
         }
     }
 }
@@ -737,6 +744,7 @@ fn consumer_loop(
     if shared.ring.is_some() {
         return consumer_ring(shared, forward, stop, scatter_tx);
     }
+    let mut last_poll = std::time::Instant::now(); // throttle the post-forward stop()
     loop {
         // (A) acquire a full bucket, polling stop() while idle.
         let bucket = loop {
@@ -782,9 +790,12 @@ fn consumer_loop(
             return Ok(());
         }
 
-        // (D) poll stop after the forward.
-        if poll_stop(&shared, &stop)? {
-            return Ok(());
+        // (D) poll stop after the forward (throttled; see last_poll above).
+        if last_poll.elapsed() >= Duration::from_millis(100) {
+            last_poll = std::time::Instant::now();
+            if poll_stop(&shared, &stop)? {
+                return Ok(());
+            }
         }
     }
 }

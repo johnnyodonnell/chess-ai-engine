@@ -184,6 +184,11 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
     use_cuda = device_str == "cuda" and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
 
+    # This self-play subprocess only does inference (the trainer is a separate
+    # process), so disable autograd ONCE here instead of entering/exiting a
+    # per-forward @torch.no_grad() context on the consumer's hot path.
+    torch.set_grad_enabled(False)
+
     def load_net(path):
         ckpt = torch.load(path, map_location=device, weights_only=False)
         cfg = ckpt.get("config", {})
@@ -260,7 +265,6 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
         # in place on the slot's pinned bf16 input and writes bf16 outputs into
         # the slot's pinned buffers. The scatter thread calls sync_slot before
         # reading them (replaces the implicit .cpu() sync).
-        @torch.no_grad()
         def forward(slot_idx, m):
             maybe_reload()
             return ring.run(state["net"], slot_idx, m)
@@ -270,7 +274,6 @@ def run_selfplay_pipeline(out_queue, stop_event, seed, sims, weights_path,
     else:
         # Legacy numpy path (CPU / bf16-off / routing test): one f32 batch in,
         # (logits, values) f32 numpy out. Unchanged contract.
-        @torch.no_grad()
         def forward(batch):
             maybe_reload()
             if batch.shape[0] != bucket_size and not state["warned_shape"]:

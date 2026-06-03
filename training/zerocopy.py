@@ -113,7 +113,6 @@ class HostRing:
         self.in_stride = in_ch * 8 * 8     # 1152
         self.logit_stride = policy         # 4672
 
-    @torch.no_grad()
     def run(self, net, slot_idx, m):
         """Run the net on slot `slot_idx`'s first m rows; write bf16 outputs into
         the slot's pinned output buffers; record the slot's event. Returns the
