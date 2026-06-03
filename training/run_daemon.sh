@@ -50,6 +50,15 @@ export CHESS_BF16="${CHESS_BF16:-1}"
 # legacy numpy forward path).
 export CHESS_ZEROCOPY="${CHESS_ZEROCOPY:-1}"
 
+# CUDA graphs for the ring forward (rust_pipeline). Captures one graph per pinned
+# slot of the COMPILED forward and replays it as a single launch, removing
+# per-kernel launch + dynamo overhead (the net is tiny/launch-bound). Measured
+# ~+9.5% forward-time in isolation. The in-place weight reload is reflected by
+# replay with no recapture (test_cudagraph_reload.py guards this). Needs the ring
+# (CHESS_ZEROCOPY=1). Default ON; rollback with
+# `CHESS_CUDAGRAPH=0 pm2 restart chess-train --update-env`.
+export CHESS_CUDAGRAPH="${CHESS_CUDAGRAPH:-1}"
+
 # Backend-specific knobs. rust_pipeline: one batch-width knob (bucket size; the
 # in-flight game pool self-regulates to ~2x it). rust_async: CPU threads are
 # decoupled from batch width (keep N_GAMES >> N_THREADS so batches stay fat).

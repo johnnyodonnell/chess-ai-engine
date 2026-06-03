@@ -13,6 +13,7 @@ Everything is bf16: the net runs bf16, so f32 outputs carried no extra info —
 returning bf16 halves the output bytes and drops the wasted .float() cast.
 """
 import ctypes
+import os
 
 import torch
 
@@ -79,9 +80,10 @@ def _cuda_view(host_t):
 # ----------------------------------------------------------------- the ring
 class Slot:
     __slots__ = ("input_host", "input_cuda", "logit_host", "logit_cuda",
-                 "value_host", "value_cuda", "event")
+                 "value_host", "value_cuda", "event", "graph")
 
     def __init__(self, B, in_ch, policy):
+        self.graph = None  # captured CUDA graph for full-batch forward (lazy)
         # pinned host buffers (the buffers the GPU reads/writes in place)
         self.input_host = torch.empty(B, in_ch, 8, 8, dtype=torch.bfloat16,
                                       pin_memory=True)
@@ -112,17 +114,57 @@ class HostRing:
         # Row strides in ELEMENTS (bf16 u16 units), row-major contiguous.
         self.in_stride = in_ch * 8 * 8     # 1152
         self.logit_stride = policy         # 4672
+        # CUDA graphs: replay a captured (compiled) forward as one launch, removing
+        # per-kernel launch + dynamo overhead. One graph per slot (each reads its
+        # own pinned input in place). Default ON; CHESS_CUDAGRAPH=0 rolls back.
+        self.use_graph = os.environ.get("CHESS_CUDAGRAPH", "1") == "1"
+        self._graph_net = None             # net the slot graphs were captured with
 
     def run(self, net, slot_idx, m):
         """Run the net on slot `slot_idx`'s first m rows; write bf16 outputs into
         the slot's pinned output buffers; record the slot's event. Returns the
         slot index back to Rust."""
         s = self.slots[slot_idx]
-        logits, values = net(s.input_cuda[:m])
-        s.logit_cuda[:m].copy_(logits)     # bf16 -> bf16, GPU writes host buffer
-        s.value_cuda[:m].copy_(values)
+        if self.use_graph and net is not self._graph_net:
+            # net was rebuilt (e.g. a recompile on architecture change) -> the
+            # captured graphs replay stale kernels; drop them and recapture. The
+            # common in-place weight reload keeps the SAME net object, so its
+            # graphs stay valid and replay reads the updated params in place.
+            for sl in self.slots:
+                sl.graph = None
+            self._graph_net = net
+        if self.use_graph and m == self.B:
+            if s.graph is None:
+                self._capture(net, s)
+            s.graph.replay()               # net + output copy, one launch, no dynamo
+        else:
+            # graphs off, or a partial batch (only at shutdown): eager compiled call
+            logits, values = net(s.input_cuda[:m])
+            s.logit_cuda[:m].copy_(logits)  # bf16 -> bf16, GPU writes host buffer
+            s.value_cuda[:m].copy_(values)
         s.event.record()
         return slot_idx
+
+    def _capture(self, net, s):
+        """Capture the compiled forward + output copy for one slot into a CUDA
+        graph. Reads s.input_cuda and writes s.logit_cuda/s.value_cuda IN PLACE
+        (same pinned buffers Rust uses), so replay is fully zero-copy. Standard
+        warmup-on-side-stream-then-capture; the net must already be compiled, which
+        the warmup calls ensure."""
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                logits, values = net(s.input_cuda)
+                s.logit_cuda.copy_(logits)
+                s.value_cuda.copy_(values)
+        torch.cuda.current_stream().wait_stream(stream)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            logits, values = net(s.input_cuda)
+            s.logit_cuda.copy_(logits)
+            s.value_cuda.copy_(values)
+        s.graph = g
 
     def sync(self, slot_idx):
         """Block until slot `slot_idx`'s forward (incl. output write) completes.
