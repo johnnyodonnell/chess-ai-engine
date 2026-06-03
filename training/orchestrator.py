@@ -173,12 +173,25 @@ def main():
         tmp.replace(path)
 
     serving_path = out_dir / "serving_weights.pt"
+    # Sidecar the Rust (tch-rs) self-play worker mtime-polls and loads in place.
+    # safetensors carries only tensors (incl. BN running stats), so the Rust net
+    # infers arch from shapes; no config blob needed. Written atomically so the
+    # poller never sees a half-written file.
+    serving_safetensors_path = out_dir / "serving_weights.safetensors"
+
+    def _atomic_save_safetensors(path, state_dict):
+        from safetensors.torch import save_file
+        cpu_sd = {k: v.detach().cpu().contiguous() for k, v in state_dict.items()}
+        tmp = path.with_suffix(".st.tmp")
+        save_file(cpu_sd, str(tmp))
+        tmp.replace(path)
 
     def publish_weights():
         _atomic_save(serving_path, {
             "weights": net.state_dict(),
             "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
         })
+        _atomic_save_safetensors(serving_safetensors_path, net.state_dict())
 
     def save_latest():
         _atomic_save(latest_path, {

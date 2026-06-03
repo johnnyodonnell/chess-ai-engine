@@ -39,11 +39,11 @@
 //! callback (brief GIL acquisition; game-rate, so rare). All MCTS math is reused
 //! verbatim from `mcts.rs`.
 
-use crate::mcts::{
+use chess_core::board::Board;
+use chess_core::mcts::{
     add_dirichlet_noise, backprop, copy_subtree, expand_node, sample_move, visits_to_pi,
     walk_to_leaf, Game, Node, ENC_LEN, MAX_PLIES, POLICY_SIZE,
 };
-use crate::Board;
 use numpy::ndarray::{Array1, Array3, Array4};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;

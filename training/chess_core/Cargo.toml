@@ -1,0 +1,15 @@
+[package]
+name = "chess_core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure chess board + AlphaZero encoding + MCTS primitives (no pyo3)"
+
+[dependencies]
+cozy-chess = "0.3"
+rand = "0.8"
+rand_distr = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

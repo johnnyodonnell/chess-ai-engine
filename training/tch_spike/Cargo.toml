@@ -1,0 +1,19 @@
+[package]
+name = "tch_spike"
+version = "0.1.0"
+edition = "2021"
+
+# Spike only: prove tch-rs links the box's libtorch 2.12-dev, runs a bf16 4x96
+# forward ON-GPU (SM121), and that CUDA-graph capture+replay reproduces it.
+[[bin]]
+name = "tch_spike"
+path = "src/main.rs"
+
+[dependencies]
+tch = "0.23"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
