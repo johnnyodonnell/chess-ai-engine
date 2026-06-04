@@ -196,7 +196,29 @@ fn aoti_time(pt2: &str, weights: &str, b: i64) {
     }
     cudagraph::device_synchronize();
     let us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
-    println!("AOTI forward (incl. output copy): {us:.0} us/fwd at B={b}");
+    println!("AOTI forward (direct, incl. output copy): {us:.0} us/fwd at B={b}");
+
+    // Wrap the AOTI run (+ output copy) in a CUDA graph and replay it as one
+    // launch. The pre-port Python path graphed its compiled forward (+output copy)
+    // and measured ~9.5% from removing per-kernel launch overhead; AOTI called
+    // directly pays that overhead every forward. This tests whether re-introducing
+    // the graph recovers it. Static input/outputs (x, out_logits, out_values);
+    // Rust would refill `x` before each replay in the real pipeline.
+    cudagraph::set_side_stream();
+    for _ in 0..5 {
+        model.run(&x, &out_logits, &out_values); // warm up cudnn algo choice etc.
+    }
+    cudagraph::device_synchronize();
+    let g = cudagraph::CudaGraph::capture(|| model.run(&x, &out_logits, &out_values));
+    cudagraph::device_synchronize();
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        g.replay();
+    }
+    cudagraph::device_synchronize();
+    let gus = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
+    println!("AOTI forward (CUDA-graph replay):  {gus:.0} us/fwd at B={b}  ({:.1}% vs direct)",
+             (gus - us) / us * 100.0);
 }
 
 /// AOTI parity on real positions: run the .pt2 on the fixture and compare the

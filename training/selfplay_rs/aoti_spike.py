@@ -51,6 +51,23 @@ try:
 except Exception as e:
     print(f"torch.compile FAILED: {e}", flush=True)
 
+# 2b) torch.compile + manual CUDA graph — the ACTUAL prod self-play forward
+# (zerocopy.py captures the compiled forward into a per-slot graph and replays it).
+# This is the number the Rust AOTI path is really competing with.
+try:
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(5):
+            _ = cnet(x)
+    torch.cuda.current_stream().wait_stream(side)
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        _out = cnet(x)
+    timeit(lambda: gr.replay(), "torch.compile + cudagraph (PROD)")
+except Exception as e:
+    print(f"torch.compile+cudagraph FAILED: {e}", flush=True)
+
 # 3) TorchScript freeze / optimize_for_inference
 try:
     traced = torch.jit.trace(net, (x,))

@@ -43,7 +43,8 @@ use crate::aoti::AotiModel;
 use crate::cudagraph::{self, CudaEvent};
 
 /// In-flight forwards (= pinned input slots = max GPU forwards queued ahead).
-const N_SLOTS: usize = 4;
+/// More slots hide scatter/CPU jitter so the GPU stays fed (higher duty cycle).
+const N_SLOTS: usize = 8;
 
 pub type Row = (Vec<f32>, Vec<f32>, f32); // (state[1152], pi[4672], z)
 
