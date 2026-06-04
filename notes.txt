@@ -1,0 +1,5 @@
+
+Features to add:
+- Right now the model doesn't factor in 3-move repitition. A pretty
+    big shortcoming
+
