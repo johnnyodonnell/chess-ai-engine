@@ -38,6 +38,9 @@ import numpy as np
 # subprocess; it talks to this trainer over a stdout frame stream. No Python
 # self-play backend / CHESS_BACKEND selection anymore.
 SELFPLAY_BIN = Path(__file__).resolve().parent / "selfplay_rs" / "target" / "release" / "selfplay_rs"
+# Evaluation is now the standalone Rust binary too (port of evaluate.py), built
+# from the same crate. Launched as a detached subprocess after each snapshot.
+EVAL_BIN = Path(__file__).resolve().parent / "selfplay_rs" / "target" / "release" / "evaluate_rs"
 _ROW_FLOATS = 18 * 8 * 8 + 4672 + 1  # state[1152] + pi[4672] + z
 
 
@@ -116,7 +119,7 @@ def main():
     import torch
     from net import ChessNet, N_BLOCKS, N_FILTERS, n_params
     from train import ReplayBuffer, train_step
-    from export import export
+    from export import export_module
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,25 +243,28 @@ def main():
             "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
         })
 
+    def _save_snapshot_st(path):
+        # Snapshot weights as fp32 safetensors (the Rust evaluator reads these;
+        # no pickled .pt). Drop num_batches_tracked (not a model parameter).
+        from safetensors.torch import save_file
+        sd = {k: v.detach().to("cpu", torch.float32).contiguous()
+              for k, v in net.state_dict().items() if "num_batches_tracked" not in k}
+        tmp = str(path) + ".tmp"
+        save_file(sd, tmp)
+        os.replace(tmp, str(path))
+
     def save_snapshot():
         snap_dir = out_dir / "snapshots"
         snap_dir.mkdir(exist_ok=True)
         hours = int(elapsed() / 3600)
         utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%MZ")
         stem = f"snap_h{hours:05d}_{utc}"
-        pt_path = snap_dir / f"{stem}.pt"
+        st_path = snap_dir / f"{stem}.safetensors"
         onnx_path = snap_dir / f"{stem}.onnx"
-        _atomic_save(pt_path, {
-            "weights": net.state_dict(),
-            "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
-            "stats": {"elapsed_sec": elapsed(), "games": total_games,
-                      "train_steps": total_train_steps, "buffer_size": len(buf)},
-        })
-        net.eval()
-        export(str(pt_path), str(onnx_path))
-        net.train()
-        print(f"[snapshot] {pt_path.name}  {onnx_path.name}", flush=True)
-        return pt_path
+        _save_snapshot_st(st_path)
+        export_module(net, str(onnx_path))  # ONNX from the in-memory net (no .pt round-trip)
+        print(f"[snapshot] {st_path.name}  {onnx_path.name}", flush=True)
+        return st_path
 
     def _pid_alive(pid):
         try:
@@ -281,19 +287,22 @@ def main():
             pass
         return True
 
-    def launch_eval(pt_path):
+    def launch_eval(st_path):
         # Reap the previous eval if it has finished, so it doesn't linger as a
         # zombie (parent never exits) and trip the staleness check below.
         prev = launch_eval.proc
         if prev is not None and prev.poll() is not None:
             launch_eval.proc = None
+        if not EVAL_BIN.exists():
+            raise SystemExit(f"eval binary not found: {EVAL_BIN} "
+                             f"(build it: cd selfplay_rs && cargo build --release)")
         lock = out_dir / "eval.lock"
         if lock.exists():
             try:
                 prev_pid = int(lock.read_text().split()[0])
                 if _pid_alive(prev_pid):
                     print(f"[eval] prior eval (pid {prev_pid}) still running; "
-                          f"skipping {pt_path.name}", flush=True)
+                          f"skipping {st_path.name}", flush=True)
                     return
             except (ValueError, IndexError, OSError):
                 pass
@@ -301,8 +310,8 @@ def main():
         logf = open(out_dir / "eval.log", "a")
         try:
             proc = subprocess.Popen(
-                [sys.executable, "evaluate.py",
-                 "--run-dir", str(out_dir), "--candidate", str(pt_path)],
+                [str(EVAL_BIN),
+                 "--run-dir", str(out_dir), "--candidate", str(st_path)],
                 cwd=str(training_dir), stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -310,7 +319,7 @@ def main():
             logf.close()
         launch_eval.proc = proc
         lock.write_text(f"{proc.pid} {time.time()}")
-        print(f"[eval] launched evaluate.py pid={proc.pid} for {pt_path.name}",
+        print(f"[eval] launched evaluate_rs pid={proc.pid} for {st_path.name}",
               flush=True)
 
     launch_eval.proc = None
@@ -418,11 +427,11 @@ def main():
 
             # Snapshot if due.
             if elapsed() >= next_snapshot_at:
-                pt_path = save_snapshot()
+                st_path = save_snapshot()
                 save_latest()
                 last_latest_save = time.time()
                 next_snapshot_at += snapshot_interval
-                launch_eval(pt_path)
+                launch_eval(st_path)
                 continue
 
             # Drain finished games from workers into the ring buffer (bounded).

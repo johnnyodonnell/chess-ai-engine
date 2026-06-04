@@ -53,16 +53,19 @@ fn main() {
     // The shim references c10_cuda / torch_cuda symbols that tch does not link.
     let torch_lib =
         py_out("import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))");
-    println!("cargo:rustc-link-search=native={}", torch_lib.trim());
-    println!("cargo:rustc-link-lib=dylib=c10_cuda");
-    println!("cargo:rustc-link-lib=dylib=torch_cuda");
-
-    // The shim calls cudaEvent* directly -> needs libcudart on the link line.
     // It ships as libcudart.so.12 (no unversioned symlink), so link by exact name.
     let cudart_dir = py_out(
         "import os, nvidia.cuda_runtime as r; print(os.path.join(os.path.dirname(r.__file__), 'lib'))",
     );
+    println!("cargo:rustc-link-search=native={}", torch_lib.trim());
     println!("cargo:rustc-link-search=native={}", cudart_dir.trim());
+    // Force-load the CUDA backend libs with --no-as-needed *before* the -l flags,
+    // so they're kept even in a binary that references no CUDA symbol directly
+    // (evaluate_rs). Otherwise the linker's default --as-needed drops torch_cuda,
+    // its static initializers never run, and tch::Cuda::is_available() == false
+    // (the self-play bin only kept them incidentally via the CUDA-graph shim).
     println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+    println!("cargo:rustc-link-arg=-lc10_cuda");
+    println!("cargo:rustc-link-arg=-ltorch_cuda");
     println!("cargo:rustc-link-arg=-l:libcudart.so.12");
 }

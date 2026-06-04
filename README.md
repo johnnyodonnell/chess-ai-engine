@@ -74,7 +74,7 @@ training/                    Python self-play + training (run on asus-nvidia)
   train.py                   loss + optimizer step
   loop.py                    orchestrator (indefinite self-play + snapshots)
   export.py                  PyTorch → ONNX
-  evaluate.py                self-play Elo eval + anchor pool + model serving
+  selfplay_rs/               Rust self-play worker + evaluate_rs (Elo eval)
 
 public/
   models/current.onnx        the live AlphaZero checkpoint
@@ -84,7 +84,7 @@ public/
 
 A long-running self-play process runs on `asus-nvidia` under pm2, saving a
 snapshot every **4 hours** of cumulative training time. After each snapshot a
-detached `evaluate.py` process plays the new snapshot against the active pool,
+detached `evaluate_rs` process plays the new snapshot against the active pool,
 fits a self-play Elo, and promotes the strongest model to `best.onnx`.
 
 Everything for a run lives in one folder in the repo:
@@ -92,9 +92,9 @@ Everything for a run lives in one folder in the repo:
 
 ```
 runs/run1/
-  snapshots/                 immutable snap_h<NNNNN>_<UTC>.{pt,onnx}
+  snapshots/                 immutable snap_h<NNNNN>_<UTC>.{safetensors,onnx}
   latest.pt                  weights+optimizer+RNG+clock for crash recovery
-  best.onnx / best.pt        current strongest model (by self-play Elo)
+  best.onnx                  current strongest model (by self-play Elo)
   pool.json                  models, ratings, accumulated match results
   eval.log                   evaluation subprocess output
 ```

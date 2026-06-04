@@ -6,7 +6,6 @@
 
 mod aoti;
 mod cudagraph;
-mod net;
 mod pipeline;
 
 use std::collections::HashMap;
@@ -15,8 +14,8 @@ use std::time::Duration;
 
 use tch::{Device, Kind, Tensor};
 
-use net::Net;
 use pipeline::Config;
+use selfplay_rs::net::Net;
 
 fn read_fixture(path: &str) -> HashMap<String, Tensor> {
     Tensor::read_safetensors(path)
