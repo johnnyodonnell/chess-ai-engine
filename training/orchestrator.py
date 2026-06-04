@@ -62,11 +62,13 @@ def parse_args():
     ap.add_argument("--snapshot-every", default="4h")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
-                    help="How often the trainer republishes weights (serving_weights.pt).")
+                    help="How often the trainer republishes weights: serving_weights.pt "
+                         "(tooling) + serving_weights.safetensors (the raw bf16 weights "
+                         "the Rust worker swaps into the live AOTI constant buffer).")
     ap.add_argument("--pt2-every", default="300s",
-                    help="How often the trainer recompiles the AOTInductor "
-                         "serving_model.pt2 the Rust worker reloads. Slower than "
-                         "--publish-every because each compile is ~5s of GPU.")
+                    help="Deprecated/unused: the AOTInductor serving_model.pt2 is now "
+                         "compiled once at startup; weights refresh via the safetensors "
+                         "sidecar (see --publish-every), no periodic recompile.")
     # self-play workers
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--games-per-worker", type=int, default=16)
@@ -182,14 +184,21 @@ def main():
         tmp.replace(path)
 
     serving_path = out_dir / "serving_weights.pt"
-    # The Rust self-play worker loads this AOTInductor package (Inductor's fused
-    # Triton cubins, no Python) and reloads it when its mtime changes. Compiling
-    # is ~5s of GPU, so it's exported on the slower --pt2-every cadence (not every
-    # 15s publish). Written atomically so the worker never sees a half-written file.
+    # The AOTInductor package (Inductor's fused Triton cubins, no Python) defines the
+    # worker's forward graph + holds the initial weights. It is compiled ONCE (compiling
+    # is ~5s of GPU); fresh weights are then pushed into the live runner's constant
+    # buffer every 15s via the safetensors sidecar below (no recompile). Compiled with
+    # use_runtime_constant_folding=True so the runner re-derives folded constants
+    # (BN-into-conv etc.) from the pushed primaries — see selfplay_rs maybe_reload.
     serving_pt2_path = out_dir / "serving_model.pt2"
+    # Raw weights the worker swaps in every publish (bf16, keyed by state_dict FQN).
+    serving_st_path = out_dir / "serving_weights.safetensors"
 
     def _export_pt2(path):
         import torch._inductor  # noqa: F401  (registers aoti_compile_and_package)
+        # Keep folded constants updatable at runtime: the worker pushes raw primaries
+        # and calls run_const_fold to re-derive the _FOLDED_CONST_* tensors.
+        torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
         ex = ChessNet(n_blocks=N_BLOCKS, n_filters=N_FILTERS).to(device).eval()
         ex.load_state_dict(net.state_dict())
         ex = ex.bfloat16()  # prod self-play runs bf16 (matches the parity baseline)
@@ -206,6 +215,16 @@ def main():
             "weights": net.state_dict(),
             "config": {"n_blocks": N_BLOCKS, "n_filters": N_FILTERS},
         })
+
+    def publish_safetensors():
+        # The worker pushes these raw bf16 primaries into the AOTI constant buffer
+        # (mangling FQN '.'->'_'). Drop num_batches_tracked (not an AOTI constant).
+        from safetensors.torch import save_file
+        sd = {k: v.detach().to("cpu", torch.bfloat16).contiguous()
+              for k, v in net.state_dict().items() if "num_batches_tracked" not in k}
+        tmp = str(serving_st_path) + ".tmp"
+        save_file(sd, tmp)
+        os.replace(tmp, str(serving_st_path))
 
     def save_latest():
         _atomic_save(latest_path, {
@@ -298,8 +317,8 @@ def main():
 
     # ----- Spawn the standalone Rust self-play worker -----
     publish_weights()              # serving_weights.pt (tooling / warm-start)
-    _export_pt2(serving_pt2_path)  # initial .pt2 the worker loads at startup
-    last_pt2_export = time.time()
+    publish_safetensors()          # serving_weights.safetensors (worker swaps these in)
+    _export_pt2(serving_pt2_path)  # the .pt2 forward graph — compiled ONCE (arch is fixed)
 
     out_queue = pyqueue.Queue(maxsize=args.queue_max)
     stop = threading.Event()
@@ -350,6 +369,7 @@ def main():
         proc = subprocess.Popen(
             [str(SELFPLAY_BIN), "serve",
              "--pt2", str(serving_pt2_path),
+             "--weights-st", str(serving_st_path),
              "--bucket", str(args.pipeline_bucket_size),
              "--threads", str(args.pipeline_n_threads),
              "--sims", str(args.sims),
@@ -461,11 +481,8 @@ def main():
             now = time.time()
             if now - last_publish >= publish_interval:
                 publish_weights()
+                publish_safetensors()  # worker swaps these into the live AOTI buffer
                 last_publish = now
-            if now - last_pt2_export >= pt2_interval:
-                # Recompile the AOTI package the Rust worker reloads (~5s GPU).
-                _export_pt2(serving_pt2_path)
-                last_pt2_export = now
             if now - last_latest_save >= save_latest_interval:
                 save_latest()
                 last_latest_save = now

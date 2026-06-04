@@ -22,6 +22,10 @@ net.load_state_dict(ck["weights"])
 net.eval().to("cuda").bfloat16()
 
 x = torch.zeros(B, 18, 8, 8, device="cuda", dtype=torch.bfloat16)
+# Match the trainer: keep folded constants runtime-updatable so the worker can
+# push raw weights via update_constant_buffer + run_const_fold (no recompile).
+import torch._inductor  # noqa: E402  (ensures torch._inductor.config is loaded)
+torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
 with torch.no_grad():
     ep = torch.export.export(net, (x,))
     path = torch._inductor.aoti_compile_and_package(ep, package_path=OUT)

@@ -5,8 +5,10 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+#include <torch/csrc/inductor/aoti_runner/model_container_runner.h>
 #include <cuda_runtime.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -49,6 +51,28 @@ void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_value
 
 void aoti_free(void* loader_) {
     delete reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
+}
+
+// In-place weight refresh (no recompile). names[] are the MANGLED constant names
+// (dotted FQN with '.'->'_'); tensors[] are tch C_tensor handles (at::Tensor*) on
+// CUDA, bf16. Push into the INACTIVE constant buffer, re-derive the _FOLDED_CONST_*
+// tensors from the new primaries (requires the .pt2 compiled with
+// use_runtime_constant_folding=True), then atomically swap it live. Runs on the
+// caller's current CUDA stream, so it serializes safely against the inference
+// thread's forwards (single reader; the active buffer is untouched until swap).
+void aoti_swap_weights(void* loader_, const char** names, const void** tensors, int n) {
+    auto* loader = reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
+    auto* runner = loader->get_runner();
+    std::unordered_map<std::string, at::Tensor> map;
+    map.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+        map[std::string(names[i])] = *reinterpret_cast<const at::Tensor*>(tensors[i]);
+    }
+    runner->update_constant_buffer(map, /*use_inactive=*/true, /*validate_full_updates=*/false);
+    auto stream = reinterpret_cast<AOTInductorStreamHandle>(
+        c10::cuda::getCurrentCUDAStream().stream());
+    runner->run_const_fold(/*use_inactive=*/true, stream);
+    runner->swap_constant_buffer();
 }
 
 // Enable cuDNN benchmark (algorithm autotuning) — picks fast conv algorithms on
