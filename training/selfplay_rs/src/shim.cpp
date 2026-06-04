@@ -37,8 +37,13 @@ void cg_event_free(void* e) {
 // reinterpret them directly. Outputs are copy_'d into Rust-owned tensors so all
 // lifetime stays on the tch side.
 void* aoti_load(const char* path) {
-    return reinterpret_cast<void*>(
-        new torch::inductor::AOTIModelPackageLoader(std::string(path)));
+    // run_single_threaded=true runs the model inline on the calling thread instead
+    // of via AOTI's thread pool. The pooled path issues an op that's illegal during
+    // CUDA-graph capture ("operation not permitted when stream is capturing", pytorch
+    // #158834); the single-threaded path is capture-safe, letting us graph the AOTI
+    // forward (and it has no downside for our single-stream inference).
+    return reinterpret_cast<void*>(new torch::inductor::AOTIModelPackageLoader(
+        std::string(path), "model", /*run_single_threaded=*/true));
 }
 
 void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_values_) {

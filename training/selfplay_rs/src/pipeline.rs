@@ -42,9 +42,9 @@ use tch::{Device, Kind, Tensor};
 use crate::aoti::AotiModel;
 use crate::cudagraph::{self, CudaEvent};
 
-/// In-flight forwards (= pinned input slots = max GPU forwards queued ahead).
-/// More slots hide scatter/CPU jitter so the GPU stays fed (higher duty cycle).
-const N_SLOTS: usize = 8;
+// In-flight forwards (= pinned input slots = max GPU forwards queued ahead) is
+// configurable via Config::n_slots (--slots); more slots hide scatter/CPU jitter
+// so the GPU stays fed (higher duty cycle).
 
 pub type Row = (Vec<f32>, Vec<f32>, f32); // (state[1152], pi[4672], z)
 
@@ -147,6 +147,7 @@ pub struct Config {
     pub bucket_size: usize,
     pub seed: u64,
     pub n_threads: usize,
+    pub n_slots: usize,       // in-flight forwards / pinned input slots
     pub model_path: String,   // serving_model.pt2 (AOTInductor graph, loaded once)
     pub weights_path: String, // serving_weights.safetensors (raw weights swapped in)
     pub reload_every: Duration,
@@ -479,7 +480,7 @@ impl Infer {
 /// hand each to the scatter thread. Blocks only when all N slots are in flight.
 fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>, free_rx: Receiver<usize>) {
     cudagraph::set_side_stream(); // a non-default stream for all inference ops
-    let mut infer = Infer::new(&shared.config, N_SLOTS);
+    let mut infer = Infer::new(&shared.config, shared.config.n_slots.max(1));
     loop {
         // acquire a full bucket, polling stop while idle.
         let bucket = loop {
@@ -560,9 +561,10 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
         let sk = sink.clone();
         workers.push(thread::spawn(move || worker_loop(sh, sk)));
     }
-    let (work_tx, work_rx) = sync_channel::<WorkItem>(N_SLOTS);
-    let (free_tx, free_rx) = sync_channel::<usize>(N_SLOTS);
-    for i in 0..N_SLOTS {
+    let n_slots = shared.config.n_slots.max(1);
+    let (work_tx, work_rx) = sync_channel::<WorkItem>(n_slots);
+    let (free_tx, free_rx) = sync_channel::<usize>(n_slots);
+    for i in 0..n_slots {
         free_tx.send(i).unwrap();
     }
     let infer = {
