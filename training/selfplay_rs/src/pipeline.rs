@@ -14,7 +14,10 @@
 //!     Workers also do the dtype conversions on both edges of the forward — they
 //!     narrow the leaf encoding f32->bf16 before pushing, and widen their own
 //!     output row bf16->f32 after — so the two singleton GPU-feeder threads stay
-//!     thin and the per-element work is parallelized across all N workers;
+//!     thin and the per-element work is parallelized across all N workers. The
+//!     16-bit payload is carried host-side as raw bf16 bits in an i16 (tch 0.23
+//!     mis-types half::bf16 as Kind::Half, so we bitcast via Tensor::view_dtype
+//!     at the device boundary rather than relying on its bf16 Element);
 //!   - ONE bounded leaf channel (crossbeam, cap = (n_slots+1)*BATCH): workers
 //!     append lock-free and block only at capacity (backpressure);
 //!   - ONE inference thread: gathers BATCH bf16 leaves off the channel, memcpys
@@ -85,9 +88,9 @@ struct LeafCtx {
     board: Board,
 }
 struct EvalResult {
-    logits: Arc<Vec<bf16>>, // full batch policy [m * POLICY_SIZE], still bf16 (widened per-row by the worker)
+    logits: Arc<Vec<i16>>, // full batch policy [m * POLICY_SIZE] as raw bf16 bits (widened per-row by the worker)
     row: usize,
-    value: bf16, // this game's value, still bf16 (widened by the worker)
+    value: i16, // this game's value as raw bf16 bits (widened by the worker)
 }
 struct InFlight {
     id: u64,
@@ -96,7 +99,7 @@ struct InFlight {
     phase: GamePhase,
     pending: Option<EvalResult>,
     leaf_ctx: Option<LeafCtx>,
-    staged_enc: Vec<bf16>, // board encoding, already narrowed to bf16 by the worker
+    staged_enc: Vec<i16>, // board encoding, already narrowed to bf16 (raw bits in i16) by the worker
 }
 
 fn spawn_fresh(shared: &Shared) -> InFlight {
@@ -188,13 +191,14 @@ fn finalize_rows(g: &mut Game) -> Vec<Row> {
         .collect()
 }
 
-/// Encode a board straight into bf16 (the dtype the forward consumes). Run on the
-/// worker thread so the f32->bf16 narrowing is parallelized across workers instead
-/// of done serially by the single inference thread when it fills a pinned slot.
-fn encode_bf16(board: &Board) -> Vec<bf16> {
+/// Encode a board and narrow it to bf16 (the dtype the forward consumes), carried
+/// as raw bf16 bits in an i16. Run on the worker thread so the f32->bf16 narrowing
+/// is parallelized across workers instead of done serially by the single inference
+/// thread when it fills a pinned slot.
+fn encode_bf16_bits(board: &Board) -> Vec<i16> {
     let mut buf = vec![0.0f32; ENC_LEN];
     board.encode_into(&mut buf);
-    buf.iter().map(|&x| bf16::from_f32(x)).collect()
+    buf.iter().map(|&x| bf16::from_f32(x).to_bits() as i16).collect()
 }
 
 fn step_move(g: &mut InFlight) {
@@ -222,9 +226,9 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
     // across workers), instead of widening the whole batch on the scatter thread.
     let logits: Vec<f32> = res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE]
         .iter()
-        .map(|x| x.to_f32())
+        .map(|&b| bf16::from_bits(b as u16).to_f32())
         .collect();
-    let value = res.value.to_f32();
+    let value = bf16::from_bits(res.value as u16).to_f32();
     match ctx.kind {
         LeafKind::RootExpand => {
             expand_node(&mut g.game.arena, 0, &ctx.board, &logits);
@@ -261,7 +265,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     continue;
                 }
                 let board = g.game.board.clone_search();
-                g.staged_enc = encode_bf16(&board);
+                g.staged_enc = encode_bf16_bits(&board);
                 g.leaf_ctx = Some(LeafCtx {
                     kind: LeafKind::RootExpand,
                     path: vec![0],
@@ -287,7 +291,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                         continue;
                     }
                     None => {
-                        g.staged_enc = encode_bf16(&board);
+                        g.staged_enc = encode_bf16_bits(&board);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::SimLeaf,
                             path,
@@ -301,7 +305,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     }
 }
 
-fn requeue_scattered(shared: &Shared, logits: Arc<Vec<bf16>>, values: &[bf16], games: Vec<Box<InFlight>>) {
+fn requeue_scattered(shared: &Shared, logits: Arc<Vec<i16>>, values: &[i16], games: Vec<Box<InFlight>>) {
     let mut q = shared.queue.lock().unwrap();
     for (r, mut g) in games.into_iter().enumerate() {
         g.pending = Some(EvalResult {
@@ -358,13 +362,15 @@ fn worker_loop(
 }
 
 // --- inference + scatter (overlapped) ---------------------------------------
-/// bf16 CUDA tensor -> Vec<bf16> on host. Just the D2H copy (bf16, half the bytes
-/// of an f32 upcast-then-copy); the bf16->f32 widening is deferred to the worker
-/// threads (apply_result), which widen only their own row in parallel.
-fn bf16_d2h(t: &Tensor) -> Vec<bf16> {
-    let c = t.to_device(Device::Cpu).contiguous();
+/// bf16 CUDA tensor -> raw bf16 bits (i16) on host. Just the D2H copy (bf16, half
+/// the bytes of an f32 upcast-then-copy); the bf16->f32 widening is deferred to the
+/// worker threads (apply_result), which widen only their own row in parallel.
+/// tch 0.23 mis-types half::bf16 as Kind::Half, so we bitcast the host bf16 tensor
+/// to Int16 (view_dtype = raw reinterpret, no numeric conversion) and copy the bits.
+fn bf16_d2h(t: &Tensor) -> Vec<i16> {
+    let c = t.to_device(Device::Cpu).contiguous().view_dtype(Kind::Int16);
     let n = c.numel();
-    let mut v = vec![bf16::ZERO; n];
+    let mut v = vec![0i16; n];
     c.copy_data(&mut v, n);
     v
 }
@@ -465,11 +471,12 @@ impl Infer {
 
     /// Fill pinned slot `slot` with `m` rows, async-H2D, launch the forward, and
     /// record a completion event. Returns owned device tensors + event (all async
-    /// — the CPU does not block on the GPU here). `enc` is already bf16 (narrowed by
-    /// the workers), so filling the pinned slot is a plain bf16->bf16 memcpy with no
-    /// per-element conversion on this single thread.
-    fn launch(&mut self, slot: usize, enc: &[bf16], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
-        let src = Tensor::from_slice(enc).reshape([m as i64, 18, 8, 8]); // CPU bf16
+    /// — the CPU does not block on the GPU here). `enc` is already bf16 bits (narrowed
+    /// by the workers, carried as i16), so filling the pinned slot is a plain
+    /// bf16->bf16 memcpy with no per-element conversion on this single thread.
+    fn launch(&mut self, slot: usize, enc: &[i16], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
+        // i16 bits -> bf16 view (bitcast, no numeric conversion), then memcpy into pinned.
+        let src = Tensor::from_slice(enc).reshape([m as i64, 18, 8, 8]).view_dtype(Kind::BFloat16);
         self.pinned_in[slot].narrow(0, 0, m as i64).copy_(&src); // bf16 -> bf16 (memcpy) into pinned
         // async H2D from pinned memory (does not block the CPU).
         let x = self.pinned_in[slot].internal_to_copy((Kind::BFloat16, self.dev), true);
@@ -496,7 +503,7 @@ fn inference_thread(
 ) {
     cudagraph::set_side_stream(); // a non-default stream for all inference ops
     let mut infer = Infer::new(&shared.config, shared.config.n_slots.max(1));
-    let mut enc: Vec<bf16> = Vec::with_capacity(BATCH * ENC_LEN); // reused scratch (bf16, staged by workers)
+    let mut enc: Vec<i16> = Vec::with_capacity(BATCH * ENC_LEN); // reused scratch (bf16 bits as i16, staged by workers)
     loop {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
