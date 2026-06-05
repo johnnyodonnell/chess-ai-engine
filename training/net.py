@@ -18,7 +18,7 @@ N_FILTERS = 96
 # with a STATIC batch (no dynamic_shapes), so the Rust self-play worker must use
 # the same value — it is `BATCH` in selfplay_rs/src/pipeline.rs and is enforced at
 # worker startup by aoti_check_batch (shim.cpp). Keep the two in sync.
-SERVING_BATCH = 512
+SERVING_BATCH = 1024
 
 
 class ResBlock(nn.Module):

@@ -58,7 +58,7 @@ use crate::cudagraph::{self, CudaEvent};
 // GPU batch width per forward. The serving_model.pt2 is exported with a STATIC
 // batch (no dynamic_shapes), so this MUST equal SERVING_BATCH in training/net.py —
 // enforced at startup by AotiModel::check_batch (aoti_check_batch in shim.cpp).
-pub const BATCH: usize = 512;
+pub const BATCH: usize = 1024;
 
 // In-flight forwards (= pinned input slots = max GPU forwards queued ahead) is
 // configurable via Config::n_slots (--slots); more slots hide scatter/CPU jitter
