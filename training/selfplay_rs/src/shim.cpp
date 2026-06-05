@@ -19,7 +19,13 @@ extern "C" {
 // thread's current CUDA stream.
 void* cg_event_new() {
     cudaEvent_t e;
-    cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    // BlockingSync: cudaEventSynchronize parks the waiting thread on an OS wait
+    // (woken by the completion interrupt) instead of spin-polling. The scatter
+    // thread waits this event once per forward, so the few-us wake latency is
+    // negligible at batch granularity, and it stops scatter from burning a full
+    // core spinning -- which only matters under CPU contention (e.g. multi-scatter
+    // or a leaf-production-bound run), but is essentially free insurance otherwise.
+    cudaEventCreateWithFlags(&e, cudaEventDisableTiming | cudaEventBlockingSync);
     return reinterpret_cast<void*>(e);
 }
 void cg_event_record(void* e) {
