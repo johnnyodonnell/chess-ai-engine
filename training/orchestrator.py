@@ -86,10 +86,9 @@ def parse_args():
     ap.add_argument("--async-max-batch", type=int, default=None,
                     help="rust_async: max rows per GPU forward. Defaults to "
                          "async-n-games.")
-    # rust_pipeline knobs (decoupled non-blocking engine; one batch-width knob)
-    ap.add_argument("--pipeline-bucket-size", type=int, default=512,
-                    help="rust_pipeline: GPU batch width per forward (the single "
-                         "tuning knob; in-flight games self-regulate to ~2x this).")
+    # rust_pipeline knobs (decoupled non-blocking engine). The GPU batch width is a
+    # fixed architectural constant (net.SERVING_BATCH = pipeline.rs BATCH); the .pt2
+    # is exported at it and the worker is hard-coded to it, so it is not a flag.
     ap.add_argument("--pipeline-n-threads", type=int, default=16,
                     help="rust_pipeline: MCTS worker threads.")
     # training
@@ -117,7 +116,7 @@ def main():
 
     # torch-heavy imports live here so `spawn`-reimported workers stay torch-free.
     import torch
-    from net import ChessNet, N_BLOCKS, N_FILTERS, n_params
+    from net import ChessNet, N_BLOCKS, N_FILTERS, SERVING_BATCH, n_params
     from train import ReplayBuffer, train_step
     from export import export_module
 
@@ -205,7 +204,7 @@ def main():
         ex = ChessNet(n_blocks=N_BLOCKS, n_filters=N_FILTERS).to(device).eval()
         ex.load_state_dict(net.state_dict())
         ex = ex.bfloat16()  # prod self-play runs bf16 (matches the parity baseline)
-        x = torch.zeros(args.pipeline_bucket_size, 18, 8, 8, device=device, dtype=torch.bfloat16)
+        x = torch.zeros(SERVING_BATCH, 18, 8, 8, device=device, dtype=torch.bfloat16)
         with torch.no_grad():
             ep = torch.export.export(ex, (x,))
             # aoti_compile_and_package requires the path to end in .pt2.
@@ -379,7 +378,6 @@ def main():
             [str(SELFPLAY_BIN), "serve",
              "--pt2", str(serving_pt2_path),
              "--weights-st", str(serving_st_path),
-             "--bucket", str(args.pipeline_bucket_size),
              "--threads", str(args.pipeline_n_threads),
              "--sims", str(args.sims),
              "--seed", str(args.seed + 1000)],
@@ -389,7 +387,7 @@ def main():
         t.start()
         proc.reader_thread = t
         print(f"spawned selfplay_rs worker pid={proc.pid} "
-              f"(threads={args.pipeline_n_threads} bucket={args.pipeline_bucket_size} "
+              f"(threads={args.pipeline_n_threads} batch={SERVING_BATCH} "
               f"sims={args.sims})", flush=True)
         return proc
 

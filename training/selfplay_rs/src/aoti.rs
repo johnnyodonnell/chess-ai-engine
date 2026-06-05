@@ -12,6 +12,7 @@ use tch::Tensor;
 extern "C" {
     fn aoti_load(path: *const std::os::raw::c_char) -> *mut c_void;
     fn aoti_run(loader: *mut c_void, input: *const c_void, out_logits: *const c_void, out_values: *const c_void);
+    fn aoti_check_batch(loader: *mut c_void, batch: std::os::raw::c_long) -> i32;
     fn aoti_free(loader: *mut c_void);
     fn aoti_swap_weights(
         loader: *mut c_void,
@@ -47,6 +48,14 @@ impl AotiModel {
                 out_values.as_ptr() as *const c_void,
             );
         }
+    }
+
+    /// Startup guard: probe whether the loaded package accepts a `[batch,18,8,8]`
+    /// input. The .pt2 is exported with a static batch, so a mismatched batch trips
+    /// the AOTI input-shape check. Returns 0 = ok, 1 = forward threw, 2 = output
+    /// batch mismatch (see `aoti_check_batch` in shim.cpp). Doubles as a warmup.
+    pub fn check_batch(&self, batch: i64) -> i32 {
+        unsafe { aoti_check_batch(self.raw, batch as std::os::raw::c_long) }
     }
 
     /// Refresh the model weights in place (no recompile): push the given constants

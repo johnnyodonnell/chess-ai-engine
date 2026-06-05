@@ -109,7 +109,6 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
     let config = Config {
         sims: flag(args, "--sims", "200").parse().unwrap(),
         add_root_noise: true,
-        bucket_size: flag(args, "--bucket", "512").parse().unwrap(),
         seed: flag(args, "--seed", "1234").parse().unwrap(),
         n_threads: flag(args, "--threads", "16").parse().unwrap(),
         n_slots: flag(args, "--slots", "8").parse().unwrap(),
@@ -341,14 +340,14 @@ fn main() {
         "time-forward" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let weights = flag(&args, "--weights", "weights.safetensors");
-            let b: i64 = flag(&args, "--bucket", "512").parse().unwrap();
+            let b: i64 = flag(&args, "--batch", "512").parse().unwrap();
             time_forward(&weights, b);
         }
         "aoti-time" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let pt2 = flag(&args, "--pt2", "serving_model.pt2");
             let weights = flag(&args, "--weights", "weights.safetensors");
-            let b: i64 = flag(&args, "--bucket", "512").parse().unwrap();
+            let b: i64 = flag(&args, "--batch", "512").parse().unwrap();
             aoti_time(&pt2, &weights, b);
         }
         "aoti-parity" => {
@@ -362,7 +361,7 @@ fn main() {
             let pt2_w1 = flag(&args, "--pt2-w1", "swap_w1.pt2");
             let pt2_w2 = flag(&args, "--pt2-w2", "swap_w2.pt2");
             let weights_w2 = flag(&args, "--weights-w2", "swap_w2.safetensors");
-            let b: i64 = flag(&args, "--bucket", "512").parse().unwrap();
+            let b: i64 = flag(&args, "--batch", "512").parse().unwrap();
             std::process::exit(if aoti_swap_parity(&pt2_w1, &pt2_w2, &weights_w2, b) { 0 } else { 1 });
         }
         other => {

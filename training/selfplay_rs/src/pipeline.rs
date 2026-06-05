@@ -6,15 +6,18 @@
 //! inference thread owns the tch net + a CUDA-graphed static device slot and
 //! talks to the worker threads with plain Rust data.
 //!
-//! Topology (mirrors the original):
+//! Topology:
 //!   - global ply-priority queue of in-flight games (most plies first);
 //!   - N worker threads advance a game's FSM until it yields ONE leaf eval (push
-//!     to the active bucket) or completes (hand rows to the sink); empty queue =>
-//!     spawn a fresh game (dynamic game count, self-regulates to ~2*bucket);
-//!   - two buckets: workers fill one while the inference thread runs the other;
-//!   - ONE inference thread: copies a full bucket into the static bf16 device
-//!     input, replays the captured CUDA graph (net forward + output copy = one
-//!     launch), reads bf16 outputs back, and requeues the games with results.
+//!     to the leaf channel) or completes (hand rows to the sink); empty queue =>
+//!     spawn a fresh game (dynamic game count, self-regulates to fill the pipe);
+//!   - ONE bounded leaf channel (crossbeam, cap = (n_slots+1)*BATCH): workers
+//!     append lock-free and block only at capacity (backpressure);
+//!   - ONE inference thread: gathers BATCH leaves off the channel, copies them
+//!     into a free pinned bf16 device slot, launches the fused AOTI forward, and
+//!     hands the in-flight slot to the scatter thread;
+//!   - ONE scatter thread: waits the forward's event, reads bf16 outputs back,
+//!     requeues the games with results, and recycles the pinned slot.
 //!
 //! Weight hot-reload: the inference thread mtime-polls the safetensors sidecar
 //! and reloads IN PLACE (Net::reload), so the captured graph keeps replaying the
@@ -26,9 +29,11 @@ use std::ffi::CString;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::{bounded, Receiver as LeafReceiver, Sender as LeafSender};
 
 use chess_core::board::Board;
 use chess_core::mcts::{
@@ -42,9 +47,14 @@ use tch::{Device, Kind, Tensor};
 use crate::aoti::AotiModel;
 use crate::cudagraph::{self, CudaEvent};
 
+// GPU batch width per forward. The serving_model.pt2 is exported with a STATIC
+// batch (no dynamic_shapes), so this MUST equal SERVING_BATCH in training/net.py —
+// enforced at startup by AotiModel::check_batch (aoti_check_batch in shim.cpp).
+pub const BATCH: usize = 512;
+
 // In-flight forwards (= pinned input slots = max GPU forwards queued ahead) is
 // configurable via Config::n_slots (--slots); more slots hide scatter/CPU jitter
-// so the GPU stays fed (higher duty cycle).
+// so the GPU stays fed (higher duty cycle). Slot size is fixed at BATCH.
 
 pub type Row = (Vec<f32>, Vec<f32>, f32); // (state[1152], pi[4672], z)
 
@@ -120,31 +130,9 @@ impl PartialOrd for Queued {
     }
 }
 
-struct Bucket {
-    enc: Vec<f32>,
-    games: Vec<Box<InFlight>>,
-}
-impl Bucket {
-    fn with_capacity(b: usize) -> Self {
-        Bucket {
-            enc: Vec::with_capacity(b * ENC_LEN),
-            games: Vec::with_capacity(b),
-        }
-    }
-    fn len(&self) -> usize {
-        self.games.len()
-    }
-}
-
-struct BucketState {
-    active: Bucket,
-    ready: Option<Bucket>,
-}
-
 pub struct Config {
     pub sims: usize,
     pub add_root_noise: bool,
-    pub bucket_size: usize,
     pub seed: u64,
     pub n_threads: usize,
     pub n_slots: usize,       // in-flight forwards / pinned input slots
@@ -155,14 +143,15 @@ pub struct Config {
 
 struct Shared {
     queue: Mutex<BinaryHeap<Queued>>,
-    buckets: Mutex<BucketState>,
-    cv_worker: Condvar,
-    cv_infer: Condvar,
     stop: AtomicBool,
     id_counter: AtomicU64,
     config: Config,
     games_done: AtomicU64,
     plies_done: AtomicU64,
+    // --- inference-thread block accounting (where the GPU producer stalls) ---
+    infer_queue_wait_us: AtomicU64, // time blocked gathering a full BATCH off the leaf channel (leaf-production bound)
+    infer_slot_wait_us: AtomicU64,  // time blocked waiting for a FREE slot (scatter/launch bound)
+    infer_forwards: AtomicU64,      // forwards launched
 }
 
 fn advance_subtree(g: &mut Game, handle: u16) {
@@ -296,35 +285,6 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     }
 }
 
-/// Push a staged game into the active bucket. Blocks only when BOTH buckets are
-/// full (backpressure). On shutdown, drops the game.
-fn push_to_bucket(shared: &Shared, g: Box<InFlight>) {
-    let b = shared.config.bucket_size;
-    let mut bs = shared.buckets.lock().unwrap();
-    loop {
-        if shared.stop.load(AtomicOrdering::Relaxed) {
-            return;
-        }
-        if bs.active.len() < b {
-            bs.active.enc.extend_from_slice(&g.staged_enc);
-            bs.active.games.push(g);
-            if bs.active.len() == b && bs.ready.is_none() {
-                let full = std::mem::replace(&mut bs.active, Bucket::with_capacity(b));
-                bs.ready = Some(full);
-                shared.cv_infer.notify_one();
-            }
-            return;
-        }
-        if bs.ready.is_none() {
-            let full = std::mem::replace(&mut bs.active, Bucket::with_capacity(b));
-            bs.ready = Some(full);
-            shared.cv_infer.notify_one();
-            continue;
-        }
-        bs = shared.cv_worker.wait(bs).unwrap();
-    }
-}
-
 fn requeue_scattered(shared: &Shared, logits: Arc<Vec<f32>>, values: &[f32], games: Vec<Box<InFlight>>) {
     let mut q = shared.queue.lock().unwrap();
     for (r, mut g) in games.into_iter().enumerate() {
@@ -340,8 +300,15 @@ fn requeue_scattered(shared: &Shared, logits: Arc<Vec<f32>>, values: &[f32], gam
 }
 
 /// Worker: pop (or spawn) a game, apply any pending result, advance until it
-/// yields one eval (push to bucket) or completes (sink), forever until stop.
-fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
+/// yields one eval (send to the leaf channel) or completes (sink), forever until
+/// stop. The leaf `send` is lock-free in the fast path and blocks only when the
+/// channel is at capacity (backpressure); it returns Err once the inference thread
+/// drops the receiver (shutdown), which ends the loop.
+fn worker_loop(
+    shared: Arc<Shared>,
+    leaf_tx: LeafSender<Box<InFlight>>,
+    sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>,
+) {
     loop {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
@@ -360,7 +327,11 @@ fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
             apply_result(&mut g, res, &shared.config);
         }
         match advance_until_eval_or_done(&mut g, &shared.config) {
-            Advance::Eval => push_to_bucket(&shared, g),
+            Advance::Eval => {
+                if leaf_tx.send(g).is_err() {
+                    return; // inference thread gone (shutdown)
+                }
+            }
             Advance::Done(rows) => {
                 shared.games_done.fetch_add(1, AtomicOrdering::Relaxed);
                 shared.plies_done.fetch_add(rows.len() as u64, AtomicOrdering::Relaxed);
@@ -410,10 +381,28 @@ struct Infer {
 impl Infer {
     fn new(config: &Config, n_slots: usize) -> Infer {
         let dev = Device::Cuda(0);
-        let b = config.bucket_size as i64;
+        let b = BATCH as i64;
         // The .pt2 defines the forward graph + initial weights and is loaded ONCE;
         // fresh weights arrive via the safetensors sidecar (maybe_reload).
         let model = AotiModel::load(&config.model_path);
+        // Guard: the package is exported with a STATIC batch, so it must have been
+        // compiled for BATCH. A mismatch either trips the AOTI shape check (caught in
+        // the shim -> code 1) or silently yields a wrong-sized output (code 2). Either
+        // way, exit the WHOLE process (not just panic this thread) so the worker dies
+        // loudly at startup and the orchestrator restarts it, rather than hanging with
+        // a dead inference thread and a stalled (silently non-producing) pipeline.
+        // This probe also serves as the first warmup forward.
+        match model.check_batch(b) {
+            0 => {}
+            code => {
+                eprintln!(
+                    "FATAL: {} was not compiled for BATCH={BATCH} (aoti_check_batch={code}); \
+                     re-export the .pt2 at this batch (see SERVING_BATCH in training/net.py)",
+                    config.model_path
+                );
+                std::process::exit(1);
+            }
+        }
         let pinned_in = (0..n_slots)
             .map(|_| Tensor::zeros([b, 18, 8, 8], (Kind::BFloat16, Device::Cpu)).pin_memory(dev))
             .collect();
@@ -476,35 +465,51 @@ impl Infer {
     }
 }
 
-/// Producer: pull full buckets, launch forwards back-to-back into free slots, and
-/// hand each to the scatter thread. Blocks only when all N slots are in flight.
-fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>, free_rx: Receiver<usize>) {
+/// Producer: gather BATCH leaves off the channel into a free pinned slot, launch
+/// the forward, and hand the in-flight slot to the scatter thread. Blocks while
+/// gathering a full batch (leaf-production bound) or waiting for a free slot
+/// (scatter/launch bound).
+fn inference_thread(
+    shared: Arc<Shared>,
+    leaf_rx: LeafReceiver<Box<InFlight>>,
+    work_tx: SyncSender<WorkItem>,
+    free_rx: Receiver<usize>,
+) {
     cudagraph::set_side_stream(); // a non-default stream for all inference ops
     let mut infer = Infer::new(&shared.config, shared.config.n_slots.max(1));
+    let mut enc: Vec<f32> = Vec::with_capacity(BATCH * ENC_LEN); // reused scratch
     loop {
-        // acquire a full bucket, polling stop while idle.
-        let bucket = loop {
-            let bs = shared.buckets.lock().unwrap();
-            if shared.stop.load(AtomicOrdering::Relaxed) {
-                return;
+        if shared.stop.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        // Gather exactly BATCH leaves, staging each into the scratch enc buffer.
+        // recv blocks when the channel is empty; Err means all worker senders are
+        // gone (shutdown) -> discard the partial batch and exit.
+        enc.clear();
+        let mut games: Vec<Box<InFlight>> = Vec::with_capacity(BATCH);
+        let t_queue = Instant::now();
+        while games.len() < BATCH {
+            match leaf_rx.recv() {
+                Ok(g) => {
+                    enc.extend_from_slice(&g.staged_enc);
+                    games.push(g);
+                }
+                Err(_) => return, // disconnected: drop the partial batch
             }
-            let mut bs = bs;
-            if let Some(b) = bs.ready.take() {
-                shared.cv_worker.notify_all();
-                break b;
-            }
-            let _ = shared.cv_infer.wait_timeout(bs, Duration::from_millis(200)).unwrap();
-            if shared.stop.load(AtomicOrdering::Relaxed) {
-                return;
-            }
-        };
-        infer.maybe_reload();
+        }
+        shared.infer_queue_wait_us.fetch_add(t_queue.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+        infer.maybe_reload(); // excluded from both waits (occasional file I/O, not a stall on the pipeline)
+        let t_slot = Instant::now();
         let slot = match free_rx.recv() {
             Ok(s) => s,
             Err(_) => return, // scatter gone
         };
-        let Bucket { enc, games } = bucket;
-        let m = games.len();
+        shared.infer_slot_wait_us.fetch_add(t_slot.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+        if shared.stop.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        shared.infer_forwards.fetch_add(1, AtomicOrdering::Relaxed);
+        let m = games.len(); // == BATCH
         let (x, out_logits, out_values, event) = infer.launch(slot, &enc, m);
         let item = WorkItem { slot, m, _x_dev: x, out_logits, out_values, event, games };
         if work_tx.send(item).is_err() {
@@ -530,19 +535,15 @@ fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>, free_tx: Syn
 }
 
 fn make_shared(config: Config) -> Arc<Shared> {
-    let bucket_size = config.bucket_size.max(1);
     Arc::new(Shared {
         queue: Mutex::new(BinaryHeap::new()),
-        buckets: Mutex::new(BucketState {
-            active: Bucket::with_capacity(bucket_size),
-            ready: None,
-        }),
-        cv_worker: Condvar::new(),
-        cv_infer: Condvar::new(),
         stop: AtomicBool::new(false),
         id_counter: AtomicU64::new(0),
         games_done: AtomicU64::new(0),
         plies_done: AtomicU64::new(0),
+        infer_queue_wait_us: AtomicU64::new(0),
+        infer_slot_wait_us: AtomicU64::new(0),
+        infer_forwards: AtomicU64::new(0),
         config,
     })
 }
@@ -554,14 +555,23 @@ struct Pipeline {
 }
 
 fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) -> Pipeline {
+    let n_slots = shared.config.n_slots.max(1);
+    // The bounded leaf channel: workers append (lock-free, blocks at capacity), the
+    // inference thread drains. Capacity (n_slots+1)*BATCH buffers one batch per slot
+    // plus one being gathered. Each worker holds a Sender clone and the inference
+    // thread the sole Receiver, so dropping them drives disconnect-based shutdown.
+    let (leaf_tx, leaf_rx) = bounded::<Box<InFlight>>((n_slots + 1) * BATCH);
+
     let n_threads = shared.config.n_threads.max(1);
     let mut workers = Vec::with_capacity(n_threads);
     for _ in 0..n_threads {
         let sh = shared.clone();
+        let tx = leaf_tx.clone();
         let sk = sink.clone();
-        workers.push(thread::spawn(move || worker_loop(sh, sk)));
+        workers.push(thread::spawn(move || worker_loop(sh, tx, sk)));
     }
-    let n_slots = shared.config.n_slots.max(1);
+    drop(leaf_tx); // workers hold the only senders now (so the receiver disconnects on shutdown)
+
     let (work_tx, work_rx) = sync_channel::<WorkItem>(n_slots);
     let (free_tx, free_rx) = sync_channel::<usize>(n_slots);
     for i in 0..n_slots {
@@ -569,7 +579,7 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
     }
     let infer = {
         let sh = shared.clone();
-        thread::spawn(move || inference_thread(sh, work_tx, free_rx))
+        thread::spawn(move || inference_thread(sh, leaf_rx, work_tx, free_rx))
     };
     let scatter = {
         let sh = shared.clone();
@@ -580,13 +590,15 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
 
 fn shutdown(shared: &Shared, p: Pipeline) {
     shared.stop.store(true, AtomicOrdering::Relaxed);
-    shared.cv_worker.notify_all();
-    shared.cv_infer.notify_all();
+    // Workers see `stop` at the loop top, exit, and drop their leaf senders. The
+    // inference thread returns at its stop-check (or when the leaf channel
+    // disconnects) and drops the receiver — which unblocks any worker parked in a
+    // full-channel send — and drops work_tx, ending the scatter thread once its
+    // queue drains. Joining workers first is safe: scatter keeps freeing slots, so
+    // the inference thread never wedges waiting on a slot during teardown.
     for h in p.workers {
         let _ = h.join();
     }
-    // Inference returns at the bucket-acquire stop-check; dropping its work_tx
-    // ends the scatter thread once its queue drains.
     let _ = p.infer.join();
     let _ = p.scatter.join();
 }
@@ -601,7 +613,9 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
     let start = Instant::now();
     let mut win_start = start;
     let (mut last_games, mut last_plies) = (0u64, 0u64);
-    println!("selfplay_rs bench: bucket={} threads={} sims={}", shared.config.bucket_size, shared.config.n_threads, shared.config.sims);
+    let (mut last_bw, mut last_sw, mut last_fwd) = (0u64, 0u64, 0u64);
+    println!("selfplay_rs bench: batch={} threads={} slots={} sims={}",
+             BATCH, shared.config.n_threads, shared.config.n_slots, shared.config.sims);
     while start.elapsed() < run {
         thread::sleep(Duration::from_millis(200));
         if win_start.elapsed() >= interval {
@@ -609,15 +623,29 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
             let g = shared.games_done.load(AtomicOrdering::Relaxed);
             let p = shared.plies_done.load(AtomicOrdering::Relaxed);
             let (dg, dp) = (g - last_games, p - last_plies);
+            // inference-thread block accounting over the window: % of wall time the
+            // single GPU-producer thread was blocked gathering a full batch off the
+            // leaf channel (leaf-production bound) vs. a free slot (scatter/launch bound).
+            let bw = shared.infer_queue_wait_us.load(AtomicOrdering::Relaxed);
+            let sw = shared.infer_slot_wait_us.load(AtomicOrdering::Relaxed);
+            let fwd = shared.infer_forwards.load(AtomicOrdering::Relaxed);
+            let (dbw, dsw, dfwd) = (bw - last_bw, sw - last_sw, fwd - last_fwd);
+            let dt_us = dt * 1e6;
             println!(
-                "[+{:5.0}s] {:6.3} games/sec  ({:5.1} avg plies, {:5.0} rows/sec)",
+                "[+{:5.0}s] {:6.3} games/sec  ({:5.1} avg plies, {:5.0} rows/sec)  | infer: queue_wait {:4.1}%  slot_wait {:4.1}%  ({:5.0} fwd/s)",
                 start.elapsed().as_secs_f64(),
                 dg as f64 / dt,
                 dp as f64 / dg.max(1) as f64,
                 dp as f64 / dt,
+                dbw as f64 / dt_us * 100.0,
+                dsw as f64 / dt_us * 100.0,
+                dfwd as f64 / dt,
             );
             last_games = g;
             last_plies = p;
+            last_bw = bw;
+            last_sw = sw;
+            last_fwd = fwd;
             win_start = Instant::now();
         }
     }

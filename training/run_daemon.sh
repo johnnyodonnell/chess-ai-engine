@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$REPO_DIR/training/.venv"
-OUT_DIR="$REPO_DIR/runs/run1"
+OUT_DIR="${OUT_DIR:-$REPO_DIR/runs/run1}"
 
 # One-time warm start: set INIT_FROM to seed a fresh run. Ignored once latest.pt exists.
 INIT_ARGS=()
@@ -27,7 +27,6 @@ exec "$VENV/bin/python" orchestrator.py \
   --out-dir "$OUT_DIR" \
   --workers "${WORKERS:-12}" \
   --sims "${SIMS:-200}" \
-  --pipeline-bucket-size "${PIPELINE_BUCKET_SIZE:-512}" \
   --pipeline-n-threads "${PIPELINE_N_THREADS:-16}" \
   --pt2-every "${PT2_EVERY:-300s}" \
   "${INIT_ARGS[@]}"

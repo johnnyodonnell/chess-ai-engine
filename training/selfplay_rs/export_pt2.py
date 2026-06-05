@@ -9,11 +9,14 @@ import sys
 import torch
 
 sys.path.insert(0, "..")
-from net import ChessNet
+from net import ChessNet, SERVING_BATCH
 
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "../../runs/run1/serving_weights.pt"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "serving_model.pt2"
-B = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+# Default to the production batch (must match BATCH in pipeline.rs); the argv
+# override exists only for ad-hoc spikes (e.g. building a mismatched .pt2 to test
+# the worker's startup guard).
+B = int(sys.argv[3]) if len(sys.argv) > 3 else SERVING_BATCH
 
 ck = torch.load(CKPT, map_location="cpu", weights_only=False)
 cfg = ck.get("config", {}) or {}

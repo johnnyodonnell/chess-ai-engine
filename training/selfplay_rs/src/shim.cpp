@@ -2,6 +2,7 @@
 // Symbols resolve against the torch_cuda / c10_cuda libs that tch links.
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/Context.h>
+#include <ATen/Functions.h> // at::zeros (factory) for the batch-guard probe
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
@@ -56,6 +57,24 @@ void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_value
 
 void aoti_free(void* loader_) {
     delete reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
+}
+
+// Startup guard: verify the loaded package was compiled for `batch`. The .pt2 is
+// exported with a STATIC batch (no dynamic_shapes), so feeding a wrong batch trips
+// an AOTI input-shape check (which throws). We catch it here because throwing
+// across the extern "C" boundary into Rust is UB. Returns 0 = ok, 1 = the forward
+// threw (batch mismatch / other error), 2 = output batch dim mismatch. Doubles as
+// a warmup forward.
+int aoti_check_batch(void* loader_, long batch) {
+    try {
+        auto* loader = reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
+        auto opts = at::TensorOptions().dtype(at::kBFloat16).device(at::kCUDA);
+        at::Tensor x = at::zeros({static_cast<int64_t>(batch), 18, 8, 8}, opts);
+        std::vector<at::Tensor> outs = loader->run({x});
+        return (!outs.empty() && outs[0].size(0) == batch) ? 0 : 2;
+    } catch (...) {
+        return 1;
+    }
 }
 
 // In-place weight refresh (no recompile). names[] are the MANGLED constant names
