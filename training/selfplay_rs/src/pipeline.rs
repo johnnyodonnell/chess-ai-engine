@@ -370,8 +370,14 @@ fn worker_loop(
 fn bf16_d2h(t: &Tensor) -> Vec<i16> {
     let c = t.to_device(Device::Cpu).contiguous().view_dtype(Kind::Int16);
     let n = c.numel();
-    let mut v = vec![0i16; n];
-    c.copy_data(&mut v, n);
+    // copy_data writes all `n` elements (and bounds-checks dst.len() >= n) and
+    // never reads dst, so copying straight into uninitialized capacity is sound
+    // and skips the redundant zero-fill of a buffer we immediately overwrite.
+    let mut v: Vec<i16> = Vec::with_capacity(n);
+    let dst = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr(), n) };
+    c.copy_data(dst, n);
+    // copy_data succeeded (it panics on error), so all n elements are initialized.
+    unsafe { v.set_len(n) };
     v
 }
 
