@@ -19,7 +19,10 @@ def export_module(net, onnx_path):
     persist weights as fp32 safetensors instead of pickled .pt)."""
     was_training = net.training
     net.eval()
-    dummy = torch.zeros(1, INPUT_CHANNELS, 8, 8, dtype=torch.float32)
+    # Match the net's device: the trainer keeps the net on CUDA, so a CPU dummy
+    # would trip "tensors on different devices" inside the tracing exporter.
+    dummy = torch.zeros(1, INPUT_CHANNELS, 8, 8, dtype=torch.float32,
+                        device=next(net.parameters()).device)
     # dynamo=False forces the legacy tracing exporter, which inlines weights
     # in the ONNX file. The new dynamo exporter externalizes them, which
     # would break browser inference (we want a single self-contained .onnx).
