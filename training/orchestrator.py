@@ -313,6 +313,7 @@ def main():
                  "--run-dir", str(out_dir), "--candidate", str(st_path)],
                 cwd=str(training_dir), stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=_worker_env(),  # libtorch/CUDA on LD_LIBRARY_PATH, as for serving
             )
         finally:
             logf.close()
