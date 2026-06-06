@@ -18,8 +18,10 @@
 //!     16-bit payload is carried host-side as raw bf16 bits in an i16 (tch 0.23
 //!     mis-types half::bf16 as Kind::Half, so we bitcast via Tensor::view_dtype
 //!     at the device boundary rather than relying on its bf16 Element);
-//!   - ONE bounded leaf channel (crossbeam, cap = (n_slots+1)*BATCH): workers
-//!     append lock-free and block only at capacity (backpressure);
+//!   - ONE bounded ply-priority pre-inference queue (Mutex<BinaryHeap> + condvars,
+//!     cap = 2*n_slots*BATCH): workers push and block only at capacity
+//!     (backpressure); the inference thread pops the highest-ply games first, so
+//!     the games closest to finishing are evaluated soonest (throughput);
 //!   - ONE inference thread: gathers BATCH bf16 leaves off the channel, memcpys
 //!     them into a free pinned bf16 device slot, launches the fused AOTI forward,
 //!     and hands the in-flight slot to the scatter thread;
@@ -36,11 +38,10 @@ use std::ffi::CString;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver as LeafReceiver, Sender as LeafSender};
 use half::bf16;
 
 use chess_core::board::Board;
@@ -138,6 +139,81 @@ impl PartialOrd for Queued {
     }
 }
 
+/// Bounded, blocking ply-priority queue feeding the inference thread (the
+/// "pre-inference" queue). Same ordering as the global worker queue — most plies
+/// first via `Queued` — but bounded at `cap` with a blocking push (backpressure)
+/// and a `gather` that waits for a full BATCH, i.e. the crossbeam leaf channel's
+/// blocking / backpressure / disconnect semantics PLUS priority ordering so the
+/// games closest to finishing are evaluated first. `closed` + `notify_all` on
+/// both condvars replaces the channel's drop-based disconnect for shutdown.
+struct PreInferQueue {
+    inner: Mutex<BinaryHeap<Queued>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    cap: usize,
+    closed: AtomicBool,
+}
+
+impl PreInferQueue {
+    fn new(cap: usize) -> PreInferQueue {
+        PreInferQueue {
+            inner: Mutex::new(BinaryHeap::new()),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+            cap,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Worker push. Blocks while the queue is at capacity (backpressure). Returns
+    /// `Err(())` once the queue is closed (shutdown), mirroring the old leaf
+    /// channel's `send` error when the receiver was gone.
+    fn push(&self, g: Box<InFlight>) -> Result<(), ()> {
+        let mut q = self.inner.lock().unwrap();
+        while q.len() >= self.cap && !self.closed.load(AtomicOrdering::Relaxed) {
+            q = self.not_full.wait(q).unwrap();
+        }
+        if self.closed.load(AtomicOrdering::Relaxed) {
+            return Err(());
+        }
+        let key = g.game.history.len() as u64;
+        let seq = g.id;
+        q.push(Queued { key, seq, item: g });
+        drop(q);
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    /// Inference gather. Blocks until `batch` leaves are available, then pops the
+    /// `batch` highest-ply games (priority order) under one lock. Returns `None`
+    /// once the queue is closed before a full batch is available (shutdown) — the
+    /// partial batch is dropped, matching the old disconnect -> discard-partial.
+    fn gather(&self, batch: usize) -> Option<Vec<Box<InFlight>>> {
+        let mut q = self.inner.lock().unwrap();
+        while q.len() < batch && !self.closed.load(AtomicOrdering::Relaxed) {
+            q = self.not_empty.wait(q).unwrap();
+        }
+        if q.len() < batch {
+            return None; // closed with only a partial batch left
+        }
+        let mut games = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            games.push(q.pop().unwrap().item);
+        }
+        drop(q);
+        self.not_full.notify_all(); // freed up to `batch` slots
+        Some(games)
+    }
+
+    /// Wake every blocked worker/inference thread and make all further push/gather
+    /// fail (shutdown). Replaces the crossbeam channel's drop-based disconnect.
+    fn close(&self) {
+        self.closed.store(true, AtomicOrdering::Relaxed);
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+}
+
 pub struct Config {
     pub sims: usize,
     pub add_root_noise: bool,
@@ -151,6 +227,7 @@ pub struct Config {
 
 struct Shared {
     queue: Mutex<BinaryHeap<Queued>>,
+    preinfer: PreInferQueue, // bounded ply-priority queue feeding the inference thread
     stop: AtomicBool,
     id_counter: AtomicU64,
     config: Config,
@@ -320,15 +397,11 @@ fn requeue_scattered(shared: &Shared, logits: Arc<Vec<i16>>, values: &[i16], gam
 }
 
 /// Worker: pop (or spawn) a game, apply any pending result, advance until it
-/// yields one eval (send to the leaf channel) or completes (sink), forever until
-/// stop. The leaf `send` is lock-free in the fast path and blocks only when the
-/// channel is at capacity (backpressure); it returns Err once the inference thread
-/// drops the receiver (shutdown), which ends the loop.
-fn worker_loop(
-    shared: Arc<Shared>,
-    leaf_tx: LeafSender<Box<InFlight>>,
-    sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>,
-) {
+/// yields one eval (push to the pre-inference queue) or completes (sink), forever
+/// until stop. The `push` blocks only when the pre-inference queue is at capacity
+/// (backpressure); it returns Err once the queue is closed (shutdown), which ends
+/// the loop.
+fn worker_loop(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) {
     loop {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
@@ -348,8 +421,8 @@ fn worker_loop(
         }
         match advance_until_eval_or_done(&mut g, &shared.config) {
             Advance::Eval => {
-                if leaf_tx.send(g).is_err() {
-                    return; // inference thread gone (shutdown)
+                if shared.preinfer.push(g).is_err() {
+                    return; // pre-inference queue closed (shutdown)
                 }
             }
             Advance::Done(rows) => {
@@ -503,7 +576,6 @@ impl Infer {
 /// (scatter/launch bound).
 fn inference_thread(
     shared: Arc<Shared>,
-    leaf_rx: LeafReceiver<Box<InFlight>>,
     work_tx: SyncSender<WorkItem>,
     free_rx: Receiver<usize>,
 ) {
@@ -514,22 +586,19 @@ fn inference_thread(
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
         }
-        // Gather exactly BATCH leaves, staging each into the scratch enc buffer.
-        // recv blocks when the channel is empty; Err means all worker senders are
-        // gone (shutdown) -> discard the partial batch and exit.
-        enc.clear();
-        let mut games: Vec<Box<InFlight>> = Vec::with_capacity(BATCH);
+        // Gather the BATCH highest-ply leaves off the pre-inference queue (priority
+        // order). gather blocks until a full BATCH is available; None means the
+        // queue is closed with only a partial batch (shutdown) -> drop it and exit.
         let t_queue = Instant::now();
-        while games.len() < BATCH {
-            match leaf_rx.recv() {
-                Ok(g) => {
-                    enc.extend_from_slice(&g.staged_enc);
-                    games.push(g);
-                }
-                Err(_) => return, // disconnected: drop the partial batch
-            }
-        }
+        let games = match shared.preinfer.gather(BATCH) {
+            Some(g) => g,
+            None => return,
+        };
         shared.infer_queue_wait_us.fetch_add(t_queue.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+        enc.clear();
+        for g in &games {
+            enc.extend_from_slice(&g.staged_enc);
+        }
         infer.maybe_reload(); // excluded from both waits (occasional file I/O, not a stall on the pipeline)
         let t_slot = Instant::now();
         let slot = match free_rx.recv() {
@@ -567,8 +636,11 @@ fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>, free_tx: Syn
 }
 
 fn make_shared(config: Config) -> Arc<Shared> {
+    // Pre-inference queue cap: 2 * (n_slots * slot_size), slot_size == BATCH.
+    let preinfer_cap = 2 * config.n_slots.max(1) * BATCH;
     Arc::new(Shared {
         queue: Mutex::new(BinaryHeap::new()),
+        preinfer: PreInferQueue::new(preinfer_cap),
         stop: AtomicBool::new(false),
         id_counter: AtomicU64::new(0),
         games_done: AtomicU64::new(0),
@@ -588,21 +660,17 @@ struct Pipeline {
 
 fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>) -> Pipeline {
     let n_slots = shared.config.n_slots.max(1);
-    // The bounded leaf channel: workers append (lock-free, blocks at capacity), the
-    // inference thread drains. Capacity (n_slots+1)*BATCH buffers one batch per slot
-    // plus one being gathered. Each worker holds a Sender clone and the inference
-    // thread the sole Receiver, so dropping them drives disconnect-based shutdown.
-    let (leaf_tx, leaf_rx) = bounded::<Box<InFlight>>((n_slots + 1) * BATCH);
-
+    // Workers push leaves into the bounded ply-priority pre-inference queue
+    // (shared.preinfer); the inference thread pops the highest-ply BATCH. Shutdown
+    // is driven by shared.preinfer.close() (see `shutdown`), which wakes everyone
+    // blocked in push/gather — replacing the old channel's drop-based disconnect.
     let n_threads = shared.config.n_threads.max(1);
     let mut workers = Vec::with_capacity(n_threads);
     for _ in 0..n_threads {
         let sh = shared.clone();
-        let tx = leaf_tx.clone();
         let sk = sink.clone();
-        workers.push(thread::spawn(move || worker_loop(sh, tx, sk)));
+        workers.push(thread::spawn(move || worker_loop(sh, sk)));
     }
-    drop(leaf_tx); // workers hold the only senders now (so the receiver disconnects on shutdown)
 
     let (work_tx, work_rx) = sync_channel::<WorkItem>(n_slots);
     let (free_tx, free_rx) = sync_channel::<usize>(n_slots);
@@ -611,7 +679,7 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
     }
     let infer = {
         let sh = shared.clone();
-        thread::spawn(move || inference_thread(sh, leaf_rx, work_tx, free_rx))
+        thread::spawn(move || inference_thread(sh, work_tx, free_rx))
     };
     let scatter = {
         let sh = shared.clone();
@@ -622,12 +690,12 @@ fn spawn_pipeline(shared: Arc<Shared>, sink: Arc<dyn Fn(Vec<Row>) + Send + Sync>
 
 fn shutdown(shared: &Shared, p: Pipeline) {
     shared.stop.store(true, AtomicOrdering::Relaxed);
-    // Workers see `stop` at the loop top, exit, and drop their leaf senders. The
-    // inference thread returns at its stop-check (or when the leaf channel
-    // disconnects) and drops the receiver — which unblocks any worker parked in a
-    // full-channel send — and drops work_tx, ending the scatter thread once its
-    // queue drains. Joining workers first is safe: scatter keeps freeing slots, so
-    // the inference thread never wedges waiting on a slot during teardown.
+    shared.preinfer.close(); // wake everyone parked in push/gather, fail further ops
+    // Workers see `stop` at the loop top (or get Err from a parked push) and exit.
+    // The inference thread returns at its stop-check or when gather sees the closed
+    // queue, and drops work_tx, ending the scatter thread once its queue drains.
+    // Joining workers first is safe: scatter keeps freeing slots, so the inference
+    // thread never wedges waiting on a slot during teardown.
     for h in p.workers {
         let _ = h.join();
     }
