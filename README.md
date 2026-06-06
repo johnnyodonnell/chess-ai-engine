@@ -7,10 +7,6 @@ available, WASM fallback) with PUCT MCTS at inference time.
 
 ## Neural network
 
-Input is on the far left, output on the far right. Each layer's real width is
-written at the top; the dots are a small, roughly proportional sample of that
-layer's neurons (not every node).
-
 ```mermaid
 flowchart LR
     subgraph IN["Input<br/>1152"]
