@@ -1,0 +1,9 @@
+# Large / recreatable artifacts — see README "Setup".
+.venv/
+stockfish/
+bin/
+
+# Eval inputs/outputs (model snapshots and per-match logs).
+models/
+logs/
+__pycache__/
