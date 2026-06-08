@@ -135,3 +135,17 @@ class AZAgent:
                     (child.visit_count == best_visits and child.q > best_q):
                 best_visits, best_q, best = child.visit_count, child.q, mv
         return best
+
+
+class RawPolicyAgent(AZAgent):
+    """Same network, no search: play the single most likely legal move
+    (argmax over the policy head). Isolates the network's raw instinct."""
+
+    def best_move(self, board):
+        if board.is_game_over(claim_draw=False):
+            return None
+        logits, _ = self._evaluate(board)
+        moves = list(board.legal_moves)
+        idxs = np.fromiter((move_to_index(m, board) for m in moves), dtype=np.int64,
+                           count=len(moves))
+        return moves[int(np.argmax(logits[idxs]))]

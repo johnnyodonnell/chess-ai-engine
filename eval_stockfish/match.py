@@ -18,7 +18,7 @@ import sys
 import chess
 import chess.engine
 
-from az_agent import AZAgent
+from az_agent import AZAgent, RawPolicyAgent
 
 SF_PATH = __import__("os").path.join(__import__("os").path.dirname(__file__), "bin", "stockfish")
 
@@ -92,6 +92,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--games", type=int, default=40)
     ap.add_argument("--sims", type=int, default=400)
+    ap.add_argument("--no-mcts", action="store_true",
+                    help="play the raw policy head (argmax, no search)")
     ap.add_argument("--model", default="../public/models/current.onnx")
     ap.add_argument("--sf-elo", type=int, default=None)
     ap.add_argument("--sf-skill", type=int, default=None)
@@ -104,14 +106,18 @@ def main():
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    agent = AZAgent(args.model, sims=args.sims, intra_threads=args.threads)
+    if args.no_mcts:
+        agent = RawPolicyAgent(args.model, intra_threads=args.threads)
+    else:
+        agent = AZAgent(args.model, sims=args.sims, intra_threads=args.threads)
     sf = make_stockfish(args)
 
     anchor = (f"UCI_Elo={args.sf_elo}" if args.sf_elo is not None
               else f"Skill={args.sf_skill}")
     limdesc = (f"nodes={args.sf_nodes}" if args.sf_nodes is not None
                else f"movetime={args.sf_movetime}s")
-    print(f"AZ(sims={args.sims}) vs Stockfish 17.1 [{anchor}, {limdesc}] | "
+    azdesc = "raw-policy" if args.no_mcts else f"sims={args.sims}"
+    print(f"AZ({azdesc}) vs Stockfish 17.1 [{anchor}, {limdesc}] | "
           f"{args.games} games, open_plies={args.open_plies}", flush=True)
 
     w = d = l = 0

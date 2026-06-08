@@ -47,3 +47,28 @@ Layer widths: input `18 × 8 × 8 = 1152`, stem and each of the 4 ResBlocks
 connection: `ReLU(BN(conv2(ReLU(BN(conv1(x))))) + x)`. The whole net is
 ~1.3 M parameters. Note the conv layers are only *locally* connected (each
 neuron sees a 3×3 patch), not fully connected as the edges above suggest.
+
+## Strength
+
+The same network plays far better with search than without it. "With MCTS"
+runs 400-simulation PUCT search at inference; "without MCTS" plays the raw
+policy head (argmax over legal-move logits, no search).
+
+Head to head over 100 games (alternating colors, 2-ply random openings):
+
+| Matchup | Record (W/D/L) | Score |
+| --- | --- | --- |
+| With MCTS vs without MCTS | 77 / 23 / 0 | 0.885 |
+
+Both configurations were also anchored against Stockfish 17.1
+(`UCI_LimitStrength`, 0.1 s/move) over 100 games each to estimate an absolute
+Elo:
+
+| Configuration | Stockfish anchor | Score (W/D/L) | Elo (95% CI) |
+| --- | --- | --- | --- |
+| With MCTS (400 sims) | 2300 | 0.465 (32 / 29 / 39) | **~2276** (2205–2344) |
+| Without MCTS (raw policy) | 1500 | 0.500 (40 / 20 / 40) | **~1500** (1431–1569) |
+
+So search is worth roughly **+780 Elo** on top of the network's raw instinct.
+The evaluation harness lives in `eval_stockfish/` (`match.py` for the Stockfish
+anchor, `match_mcts_vs_raw.py` for the head-to-head).
