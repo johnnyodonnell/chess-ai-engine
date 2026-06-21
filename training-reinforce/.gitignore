@@ -1,0 +1,6 @@
+runs/
+parity/
+selfplay_rs/target/
+__pycache__/
+.venv/
+*.pyc

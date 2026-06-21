@@ -1,0 +1,7 @@
+# Link tch against the venv's PyTorch libtorch (LIBTORCH_USE_PYTORCH) and bypass
+# the tch<->torch version pin (we run a newer torch nightly than tch 0.23 expects).
+# SELFPLAY_PYTHON (used by build.rs to locate torch/cudart libs) is left to the
+# environment — activate / point at the project venv before building.
+[env]
+LIBTORCH_USE_PYTORCH = "1"
+LIBTORCH_BYPASS_VERSION_CHECK = "1"
