@@ -40,12 +40,22 @@ def train_on_cohort(net, opt, cohort, device, *, micro_batch=8192,
     opt.zero_grad(set_to_none=True)
     agg = {"loss": 0.0, "policy": 0.0, "value": 0.0, "entropy": 0.0}
 
-    # One optimizer step over the whole cohort, accumulated micro-batch by
-    # micro-batch. Each chunk's mean loss is weighted by |chunk|/n so the summed
-    # gradient is exactly the full-cohort mean gradient.
-    for start in range(0, n, micro_batch):
-        idx = perm[start:start + micro_batch]
-        w = len(idx) / n
+    # Use only a whole number of micro_batch-sized chunks so every forward has the
+    # same shape — torch.compile then compiles one graph and reuses it, instead of
+    # recompiling for a variable-size tail each cohort. The dropped remainder is
+    # < micro_batch random rows (perm is shuffled), negligible for a ~200k cohort.
+    if n > micro_batch:
+        n_used = (n // micro_batch) * micro_batch
+        chunks = [perm[i:i + micro_batch] for i in range(0, n_used, micro_batch)]
+    else:
+        n_used = n
+        chunks = [perm]
+
+    # One optimizer step over the cohort, accumulated chunk by chunk. Each chunk's
+    # mean loss is weighted by |chunk|/n_used so the summed gradient is exactly the
+    # mean gradient over the used rows.
+    for idx in chunks:
+        w = len(idx) / n_used
         s = torch.from_numpy(states[idx]).to(device).view(-1, 18, 8, 8)
         m = torch.from_numpy(masks[idx]).to(device)
         a = torch.from_numpy(actions[idx]).to(device)

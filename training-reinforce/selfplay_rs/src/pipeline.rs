@@ -167,6 +167,7 @@ fn worker(
 fn inference(
     net: Net,
     dev: Device,
+    kind: Kind,
     rx: Receiver<InFlight>,
     workers: Vec<Sender<Reply>>,
     shared: Arc<Shared>,
@@ -197,7 +198,10 @@ fn inference(
         for inf in &items {
             enc_flat.extend_from_slice(&inf.pending.enc);
         }
-        let x = Tensor::from_slice(&enc_flat).reshape([m as i64, 18, 8, 8]).to_device(dev);
+        let x = Tensor::from_slice(&enc_flat)
+            .reshape([m as i64, 18, 8, 8])
+            .to_device(dev)
+            .to_kind(kind);
         let (logits, _) = tch::no_grad(|| net.forward(&x));
         let logits = logits.to_kind(Kind::Float).to_device(Device::Cpu).contiguous();
         let mut lbuf = vec![0f32; m * POLICY_SIZE];
@@ -223,7 +227,11 @@ pub fn run_on(cfg: &Config, dev: Device) -> usize {
     // oversubscription slowdowns. Pin it to 1 so the cores go to the workers.
     tch::set_num_threads(1);
 
-    let net = Net::load(&cfg.weights, dev, Kind::Float);
+    // bf16 forward on the GPU (≈2× the fp32 forward + half the logits D2H); the
+    // sampled policy tolerates the lower precision. CPU stays fp32 (libtorch CPU
+    // conv has no bf16 path).
+    let kind = if matches!(dev, Device::Cpu) { Kind::Float } else { Kind::BFloat16 };
+    let net = Net::load(&cfg.weights, dev, kind);
     let n_threads = cfg.threads.max(1);
     let batch = cfg.batch.max(1);
     // 0 => 2*batch: keep ~a batch of games being processed by workers while the
@@ -271,7 +279,7 @@ pub fn run_on(cfg: &Config, dev: Device) -> usize {
 
     let inf_handle = {
         let sh = shared.clone();
-        thread::spawn(move || inference(net, dev, to_infer_rx, worker_txs, sh, batch))
+        thread::spawn(move || inference(net, dev, kind, to_infer_rx, worker_txs, sh, batch))
     };
 
     let mut buffers: Vec<Vec<f32>> = Vec::with_capacity(n_threads);

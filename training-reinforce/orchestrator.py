@@ -143,6 +143,10 @@ def main():
     print(f"device={device}", flush=True)
 
     net = ChessNet().to(device)
+    # Train through a compiled wrapper (fuses the tiny launch-bound ChessNet);
+    # keep the raw module for state_dict / safetensors / ONNX so the saved keys
+    # stay plain FQNs (no `_orig_mod.` prefix) that the Rust forward loads.
+    net_train = torch.compile(net)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
 
@@ -263,7 +267,7 @@ def main():
         # in --micro-batch chunks so a huge cohort's single step stays within GPU
         # memory (and coexists with other GPU jobs on the box).
         stats = train_on_cohort(
-            net, opt, cohort, device,
+            net_train, opt, cohort, device,
             micro_batch=args.micro_batch,
             c_value=args.c_value, c_entropy=args.c_entropy, rng=rng,
         )
