@@ -33,11 +33,11 @@ use tch::{Device, Kind, Tensor};
 use chess_core::{pack_move, Board, ENC_LEN};
 
 use crate::net::Net;
-use crate::selfplay::{pick_device, ply_temp, sample_action, Config, POLICY_SIZE, ROW_FLOATS};
+use crate::selfplay::{pick_device, ply_temp, sample_action, Config, MASK_WORDS, POLICY_SIZE, ROW_WORDS};
 
 struct Decision {
     state: Vec<f32>,
-    mask: Vec<f32>,
+    mask: Vec<u32>, // legal mask, packed 1 bit per move (MASK_WORDS u32 words)
     action: u32,
     white_to_move: bool,
 }
@@ -47,7 +47,7 @@ struct Decision {
 struct Pending {
     enc: Vec<f32>,         // encoded current position (the net input == decision state)
     cand: Vec<(usize, u16)>, // (policy_index, packed_move) per legal move
-    mask: Vec<f32>,        // 4672 legal mask
+    mask: Vec<u32>,        // packed legal-move bitset (MASK_WORDS words)
     white_to_move: bool,
 }
 
@@ -82,27 +82,28 @@ fn new_game(board: Board) -> Game {
 fn prepare(board: &Board) -> Pending {
     let mut enc = vec![0f32; ENC_LEN];
     board.encode_into(&mut enc);
-    let mut mask = vec![0f32; POLICY_SIZE];
+    let mut mask = vec![0u32; MASK_WORDS];
     let mut cand = Vec::with_capacity(48);
     for mv in board.legal_moves_vec() {
         let idx = board.move_to_index(mv) as usize;
-        mask[idx] = 1.0;
+        mask[idx / 32] |= 1u32 << (idx % 32); // pack legal move into the bitset
         cand.push((idx, pack_move(mv)));
     }
     Pending { enc, cand, mask, white_to_move: board.turn() }
 }
 
-/// Drain a finished game's decisions into the worker's local row buffer, scoring
-/// each by the terminal outcome from that mover's POV. Returns rows emitted.
-fn finalize(game: &mut Game, buf: &mut Vec<f32>) -> usize {
+/// Drain a finished game's decisions into the worker's local row buffer (one
+/// 4-byte word per slot), scoring each by the terminal outcome from that mover's
+/// POV. Returns rows emitted.
+fn finalize(game: &mut Game, buf: &mut Vec<u32>) -> usize {
     let ow = game.board.outcome_white().unwrap_or(0) as f32; // ply cap => draw 0
     let mut k = 0;
     for d in game.decisions.drain(..) {
         let z = if d.white_to_move { ow } else { -ow };
-        buf.extend_from_slice(&d.state);
-        buf.extend_from_slice(&d.mask);
-        buf.push(d.action as f32);
-        buf.push(z);
+        buf.extend(d.state.iter().map(|s| s.to_bits())); // f32 bits
+        buf.extend_from_slice(&d.mask); // packed legal bitset (u32)
+        buf.push(d.action); // u32 move index
+        buf.push(z.to_bits()); // f32 bits
         k += 1;
     }
     k
@@ -120,8 +121,8 @@ fn worker(
     to_infer: Sender<InFlight>,
     shared: Arc<Shared>,
     mut rng: StdRng,
-) -> (Vec<f32>, usize) {
-    let mut buf: Vec<f32> = Vec::new();
+) -> (Vec<u32>, usize) {
+    let mut buf: Vec<u32> = Vec::new();
     let mut rows = 0usize;
 
     while let Ok((mut inf, logits, j)) = rx.recv() {
@@ -282,7 +283,7 @@ pub fn run_on(cfg: &Config, dev: Device) -> usize {
         thread::spawn(move || inference(net, dev, kind, to_infer_rx, worker_txs, sh, batch))
     };
 
-    let mut buffers: Vec<Vec<f32>> = Vec::with_capacity(n_threads);
+    let mut buffers: Vec<Vec<u32>> = Vec::with_capacity(n_threads);
     let mut total = 0usize;
     for h in handles {
         let (buf, rows) = h.join().expect("worker panicked");
@@ -302,13 +303,13 @@ pub fn run_on(cfg: &Config, dev: Device) -> usize {
     total
 }
 
-fn write_cohort(path: &str, buffers: &[Vec<f32>], n_rows: usize) {
+fn write_cohort(path: &str, buffers: &[Vec<u32>], n_rows: usize) {
     let f = File::create(path).unwrap_or_else(|e| panic!("create {path}: {e}"));
     let mut w = BufWriter::new(f);
     w.write_all(&(n_rows as u32).to_le_bytes()).unwrap();
-    w.write_all(&(ROW_FLOATS as u32).to_le_bytes()).unwrap();
+    w.write_all(&(ROW_WORDS as u32).to_le_bytes()).unwrap();
     for b in buffers {
-        // f32 slice -> &[u8] (little-endian on x86/ARM; matches read_cohort).
+        // u32 word slice -> &[u8] (little-endian on x86/ARM; matches read_cohort).
         let bytes = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, b.len() * 4) };
         w.write_all(bytes).unwrap();
     }

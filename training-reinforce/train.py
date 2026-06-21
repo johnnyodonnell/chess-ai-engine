@@ -28,13 +28,15 @@ MASK_NEG = 1.0e9
 def train_on_cohort(net, opt, cohort, device, *, micro_batch=8192,
                     c_value=1.0, c_entropy=0.05, grad_clip=1.0, rng=None):
     states = cohort["states"]
-    masks = cohort["masks"]
+    mask_bits = cohort["mask_bits"]  # int32 [n, MASK_WORDS]: packed legal mask
     actions = cohort["actions"]
     z = cohort["z"]
     n = cohort["n"]
     if rng is None:
         rng = np.random.default_rng()
     perm = rng.permutation(n)
+    # Per-word bit shifts, for unpacking the bitset to a float mask on the GPU.
+    shifts = torch.arange(32, device=device, dtype=torch.int32)
 
     net.train()
     opt.zero_grad(set_to_none=True)
@@ -57,9 +59,12 @@ def train_on_cohort(net, opt, cohort, device, *, micro_batch=8192,
     for idx in chunks:
         w = len(idx) / n_used
         s = torch.from_numpy(states[idx]).to(device).view(-1, 18, 8, 8)
-        m = torch.from_numpy(masks[idx]).to(device)
         a = torch.from_numpy(actions[idx]).to(device)
         zz = torch.from_numpy(z[idx]).to(device).float()
+        # Unpack the packed bitset to a [chunk, POLICY] float mask on the GPU:
+        # transfer MASK_WORDS int32 (32x less than a dense f32 mask), then expand.
+        bits = torch.from_numpy(mask_bits[idx]).to(device)  # int32 [chunk, MASK_WORDS]
+        m = ((bits.unsqueeze(-1) >> shifts) & 1).to(torch.float32).reshape(bits.shape[0], -1)
 
         logits, v = net(s)
         masked = logits + (m - 1.0) * MASK_NEG

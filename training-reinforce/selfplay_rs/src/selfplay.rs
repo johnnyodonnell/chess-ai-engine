@@ -2,9 +2,11 @@
 //! device pick). The actual game generation runs in `pipeline` (multi-threaded,
 //! GPU-overlapped); this module holds the pieces both it and the CLI share.
 //!
-//! Cohort row layout (ROW_FLOATS = ENC_LEN + POLICY_SIZE + 2):
-//!   [ state(1152) | legal_mask(4672) | action_index | z ]
-//! File: u32 num_rows (LE), u32 row_floats (LE), then num_rows*row_floats f32 LE.
+//! Cohort row layout, in 4-byte words (ROW_WORDS = ENC_LEN + MASK_WORDS + 2):
+//!   [ state(1152 f32) | legal_mask(146 u32 bitset) | action(u32) | z(f32) ]
+//! The legal mask is packed 1 bit per move (move i -> bit i%32 of word i/32),
+//! 32x smaller than a 4672-f32 mask. File: u32 num_rows (LE), u32 row_words (LE),
+//! then num_rows*row_words 4-byte words LE (f32 bits / u32 as noted above).
 //!
 //! Reward is vanilla REINFORCE: each decision is scored by the terminal game
 //! outcome from that mover's POV (z = +1 win / 0 draw / -1 loss, undiscounted),
@@ -18,7 +20,10 @@ use chess_core::ENC_LEN;
 
 /// AlphaZero policy size: 64 squares * 73 planes.
 pub const POLICY_SIZE: usize = 4672;
-pub const ROW_FLOATS: usize = ENC_LEN + POLICY_SIZE + 2;
+/// Legal mask packed as a bitset: 146 u32 words cover 4672 moves (1 bit each).
+pub const MASK_WORDS: usize = POLICY_SIZE.div_ceil(32); // 146
+/// Cohort row in 4-byte words: state(1152 f32) | mask(146 u32) | action(u32) | z(f32).
+pub const ROW_WORDS: usize = ENC_LEN + MASK_WORDS + 2;
 
 pub struct Config {
     pub weights: String,
