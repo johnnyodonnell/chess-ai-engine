@@ -113,7 +113,7 @@ def parse_args():
     ap.add_argument("--selfplay-concurrency", type=int, default=0,
                     help="games kept in flight (0 = 2x batch); overlaps CPU game logic with the GPU forward")
     ap.add_argument("--max-plies", type=int, default=200, help="ply cap; over it a game is a draw")
-    ap.add_argument("--micro-batch", type=int, default=8192,
+    ap.add_argument("--micro-batch", type=int, default=32768,
                     help="rows per forward in the accumulated SGD step (bounds GPU memory; "
                          "the step is still one optimizer update over the whole cohort)")
     ap.add_argument("--temperature", type=float, default=1.0, help="opening sampling temperature")
