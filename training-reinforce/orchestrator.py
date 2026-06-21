@@ -146,6 +146,10 @@ def main():
     # Train through a compiled wrapper (fuses the tiny launch-bound ChessNet);
     # keep the raw module for state_dict / safetensors / ONNX so the saved keys
     # stay plain FQNs (no `_orig_mod.` prefix) that the Rust forward loads.
+    # NB: mode="reduce-overhead" (CUDA graphs) is incompatible with our
+    # micro-batch gradient accumulation — each chunk's backward needs its forward
+    # activations to persist, but cudagraphs reuse that static memory across
+    # chunks (verified to error; see git history). Default mode it is.
     net_train = torch.compile(net)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
