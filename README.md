@@ -72,3 +72,40 @@ Elo:
 So search is worth roughly **+780 Elo** on top of the network's raw instinct.
 The evaluation harness lives in `eval_stockfish/` (`match.py` for the Stockfish
 anchor, `match_mcts_vs_raw.py` for the head-to-head).
+
+## Training method: AlphaZero (MCTS) vs vanilla REINFORCE
+
+The repo has two independent trainers for the *same* network: the AlphaZero-style
+trainer in `training/` (MCTS-guided self-play, with policy/value targets distilled
+from the search tree) and a vanilla **REINFORCE** policy-gradient trainer in
+`training-reinforce/` (no search — moves are sampled from the raw policy and pushed
+toward the game outcome). To measure what the MCTS-in-the-loop training actually
+buys, we played their snapshots head to head.
+
+The matchup: `snap_h00073` from the REINFORCE run (≈73 h self-play) vs
+`snap_h00052` from the AlphaZero run (≈52 h self-play) — note the REINFORCE net had
+*more* self-play time. 200 games per condition, alternating colors,
+temperature-sampled openings, draw-adjudicated at 200 plies.
+
+| Condition | REINFORCE record (W/D/L) | REINFORCE score | Elo gap (AlphaZero − REINFORCE) |
+| --- | --- | --- | --- |
+| Raw policy, no MCTS | 6 / 35 / 159 | 0.118 | **+350** |
+| With MCTS (400 sims, both sides) | 0 / 35 / 165 | 0.088 | **+407** |
+
+The MCTS-trained network wins ~88–91% either way. Adding 400-sim search at play
+time *widens* the gap rather than closing it: search amplifies the AlphaZero net
+(which was trained to be searched) but does little for the REINFORCE net — a pure
+policy that never learned to exploit a tree — which actually scored slightly worse
+with MCTS than without.
+
+Anchored against Stockfish 17.1, the REINFORCE net (raw policy) is only
+**≈850 Elo** (95% CI ~560–1000, a lopsided single-anchor estimate): it loses ~90%
+even to the weakest reachable Stockfish (Skill 0, 1-node search), i.e. it sits
+*below* Stockfish's entire calibrated range. For reference the AlphaZero net with
+MCTS measures **≈2300 Elo** on the same harness.
+
+**Takeaway:** training the same network with MCTS-guided self-play instead of
+vanilla REINFORCE is worth on the order of **+350–400 Elo head-to-head** — and far
+more on an absolute scale — despite the REINFORCE model logging *more* self-play
+hours. Search in the training loop, not just at inference, is what carries the
+network from beginner-level instinct to a strong engine.
